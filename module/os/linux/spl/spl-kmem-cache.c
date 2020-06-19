@@ -1719,20 +1719,18 @@ spl_kmem_cache_reap_now(spl_kmem_cache_t *skc)
 		uint64_t objects = UINT64_MAX;
 		int do_reclaim;
 
-		do {
-			spin_lock(&skc->skc_lock);
-			do_reclaim =
-			    (skc->skc_slab_total > 0) &&
-			    ((skc->skc_slab_total-skc->skc_slab_alloc) == 0) &&
-			    (skc->skc_obj_alloc < objects);
+		spin_lock(&skc->skc_lock);
+		do_reclaim =
+		    (skc->skc_slab_total > 0) &&
+		    ((skc->skc_slab_total-skc->skc_slab_alloc) == 0) &&
+		    (skc->skc_obj_alloc < objects);
 
-			objects = skc->skc_obj_alloc;
-			spin_unlock(&skc->skc_lock);
+		objects = skc->skc_obj_alloc;
+		spin_unlock(&skc->skc_lock);
 
-			if (do_reclaim)
-				skc->skc_reclaim(skc->skc_private);
+		if (do_reclaim)
+			skc->skc_reclaim(skc->skc_private);
 
-		} while (do_reclaim);
 	}
 
 	/* Reclaim from the magazine and free all now empty slabs. */

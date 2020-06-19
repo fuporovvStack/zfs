@@ -232,8 +232,6 @@ arc_shrinker_scan(struct shrinker *shrink, struct shrink_control *sc)
 		}
 		mutex_exit(&arc_adjust_lock);
 
-		if (current_is_kswapd())
-			arc_kmem_reap_soon();
 		pages = MAX((int64_t)pages -
 		    (int64_t)btop(arc_evictable_memory()), 0);
 		/*
