@@ -57,9 +57,6 @@
 #include <sys/trace_zfs.h>
 #include <sys/aggsum.h>
 
-int64_t last_free_memory;
-free_memory_reason_t last_free_reason;
-
 /*
  * Return a default max arc size based on the amount of physical memory.
  */
@@ -128,25 +125,7 @@ int64_t arc_swapfs_reserve = 64;
 int64_t
 arc_available_memory(void)
 {
-	int64_t lowest = INT64_MAX;
-	free_memory_reason_t r = FMR_UNKNOWN;
-	int64_t n;
-
-	if (arc_need_free > 0) {
-		lowest = -arc_need_free;
-		r = FMR_NEEDFREE;
-	}
-
-	n = arc_free_memory() - arc_sys_free - arc_need_free;
-	if (n < lowest) {
-		lowest = n;
-		r = FMR_LOTSFREE;
-	}
-
-	last_free_memory = lowest;
-	last_free_reason = r;
-
-	return (lowest);
+	return (arc_free_memory() - arc_sys_free);
 }
 
 static uint64_t
@@ -180,32 +159,37 @@ arc_evictable_memory(void)
 static unsigned long
 arc_shrinker_count(struct shrinker *shrink, struct shrink_control *sc)
 {
+	/*
+	 * kswapd doesn't know how much we evict, because it's only looking
+	 * for pages to be added to the inactive lists.  This causes it to
+	 * ask us to evict the entire ARC.  Instead, we ignore its requests
+	 * and manage the free memory in arc_reap_cb[_check]().
+	 */
+	if (current_is_kswapd()) {
+		return (0);
+	}
+
+	/*
+	 * __GFP_FS won't be set if we are called from ZFS code.  To avoid a
+	 * deadlock, we don't allow evicting in this case.  We return 0
+	 * rather than SHRINK_STOP so that the shrinker logic doesn't
+	 * accumulate a deficit against us.
+	 */
+	if (!(sc->gfp_mask & __GFP_FS)) {
+		return (0);
+	}
+
 	return (btop((int64_t)arc_evictable_memory()));
 }
 
 static unsigned long
 arc_shrinker_scan(struct shrinker *shrink, struct shrink_control *sc)
 {
-	int64_t pages;
-
 	/* The arc is considered warm once reclaim has occurred */
 	if (unlikely(arc_warm == B_FALSE))
 		arc_warm = B_TRUE;
 
-	/* Return the potential number of reclaimable pages */
-	pages = btop((int64_t)arc_evictable_memory());
-
-	/* Not allowed to perform filesystem reclaim */
-	if (!(sc->gfp_mask & __GFP_FS))
-		return (SHRINK_STOP);
-
-	/* Reclaim in progress */
-	if (mutex_tryenter(&arc_adjust_lock) == 0) {
-		ARCSTAT_INCR(arcstat_need_free, ptob(sc->nr_to_scan));
-		return (0);
-	}
-
-	mutex_exit(&arc_adjust_lock);
+	int64_t pages = btop((int64_t)arc_evictable_memory());
 
 	/*
 	 * Evict the requested number of pages by shrinking arc_c the
@@ -233,27 +217,17 @@ arc_shrinker_scan(struct shrinker *shrink, struct shrink_control *sc)
 
 		pages = MAX((int64_t)pages -
 		    (int64_t)btop(arc_evictable_memory()), 0);
-		/*
-		 * We've shrunk what we can, wake up threads.
-		 */
-		cv_broadcast(&arc_adjust_waiters_cv);
-	} else
-		pages = SHRINK_STOP;
+	}
 
 	/*
 	 * When direct reclaim is observed it usually indicates a rapid
-	 * increase in memory pressure.  This occurs because the kswapd
-	 * threads were unable to asynchronously keep enough free memory
-	 * available.  In this case set arc_no_grow to briefly pause arc
+	 * increase in memory pressure.  This occurs because the
+	 * arc_reap_zthr was unable to asynchronously keep enough free memory
+	 * available.  In this case, set arc_no_grow to briefly pause arc
 	 * growth to avoid compounding the memory pressure.
 	 */
-	if (current_is_kswapd()) {
-		ARCSTAT_BUMP(arcstat_memory_indirect_count);
-	} else {
-		arc_no_grow = B_TRUE;
-		arc_kmem_reap_soon();
-		ARCSTAT_BUMP(arcstat_memory_direct_count);
-	}
+	arc_no_grow = B_TRUE;
+	ARCSTAT_BUMP(arcstat_memory_direct_count);
 
 	return (pages);
 }
@@ -315,7 +289,6 @@ arc_lowmem_init(void)
 	 * memory pressure, before running completely out of memory.
 	 */
 	arc_sys_free = allmem / 32;
-	arc_need_free = 0;
 }
 
 void
@@ -356,14 +329,10 @@ int64_t
 arc_available_memory(void)
 {
 	int64_t lowest = INT64_MAX;
-	free_memory_reason_t r = FMR_UNKNOWN;
 
 	/* Every 100 calls, free a small amount */
 	if (spa_get_random(100) == 0)
 		lowest = -1024;
-
-	last_free_memory = lowest;
-	last_free_reason = r;
 
 	return (lowest);
 }

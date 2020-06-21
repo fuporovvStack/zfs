@@ -823,7 +823,6 @@ typedef struct arc_stats {
 	kstat_named_t arcstat_l2_rebuild_log_blks;
 	kstat_named_t arcstat_memory_throttle_count;
 	kstat_named_t arcstat_memory_direct_count;
-	kstat_named_t arcstat_memory_indirect_count;
 	kstat_named_t arcstat_memory_all_bytes;
 	kstat_named_t arcstat_memory_free_bytes;
 	kstat_named_t arcstat_memory_available_bytes;
@@ -840,7 +839,7 @@ typedef struct arc_stats {
 	kstat_named_t arcstat_async_upgrade_sync;
 	kstat_named_t arcstat_demand_hit_predictive_prefetch;
 	kstat_named_t arcstat_demand_hit_prescient_prefetch;
-	kstat_named_t arcstat_need_free;
+	kstat_named_t arcstat_need_free; /* deprecated, consumed by arcstat */
 	kstat_named_t arcstat_sys_free;
 	kstat_named_t arcstat_raw_size;
 	kstat_named_t arcstat_cached_only_in_progress;
@@ -870,7 +869,6 @@ typedef enum free_memory_reason_t {
 #define	arc_c_min	ARCSTAT(arcstat_c_min)	/* min target cache size */
 #define	arc_c_max	ARCSTAT(arcstat_c_max)	/* max target cache size */
 #define	arc_sys_free	ARCSTAT(arcstat_sys_free) /* target system free bytes */
-#define	arc_need_free	ARCSTAT(arcstat_need_free) /* bytes to be freed */
 
 extern taskq_t *arc_prune_taskq;
 extern arc_stats_t arc_stats;

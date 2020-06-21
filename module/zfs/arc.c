@@ -543,7 +543,6 @@ arc_stats_t arc_stats = {
 	{ "l2_rebuild_log_blks",	KSTAT_DATA_UINT64 },
 	{ "memory_throttle_count",	KSTAT_DATA_UINT64 },
 	{ "memory_direct_count",	KSTAT_DATA_UINT64 },
-	{ "memory_indirect_count",	KSTAT_DATA_UINT64 },
 	{ "memory_all_bytes",		KSTAT_DATA_UINT64 },
 	{ "memory_free_bytes",		KSTAT_DATA_UINT64 },
 	{ "memory_available_bytes",	KSTAT_DATA_INT64 },
@@ -559,7 +558,10 @@ arc_stats_t arc_stats = {
 	{ "async_upgrade_sync",		KSTAT_DATA_UINT64 },
 	{ "demand_hit_predictive_prefetch", KSTAT_DATA_UINT64 },
 	{ "demand_hit_prescient_prefetch", KSTAT_DATA_UINT64 },
+
+	/* arc_need_free is deprecated, but consumed by arcstat */
 	{ "arc_need_free",		KSTAT_DATA_UINT64 },
+
 	{ "arc_sys_free",		KSTAT_DATA_UINT64 },
 	{ "arc_raw_size",		KSTAT_DATA_UINT64 },
 	{ "cached_only_in_progress",	KSTAT_DATA_UINT64 },
@@ -4768,7 +4770,6 @@ arc_adjust_cb(void *arg, zthr_t *zthr)
 		 * arc_get_data_impl() sooner.
 		 */
 		cv_broadcast(&arc_adjust_waiters_cv);
-		arc_need_free = 0;
 	}
 	mutex_exit(&arc_adjust_lock);
 	spl_fstrans_unmark(cookie);
@@ -4851,9 +4852,6 @@ arc_reap_cb(void *arg, zthr_t *zthr)
 	int64_t to_free =
 	    (arc_c >> arc_shrink_shift) - free_memory;
 	if (to_free > 0) {
-#ifdef _KERNEL
-		to_free = MAX(to_free, arc_need_free);
-#endif
 		arc_reduce_target_size(to_free);
 	}
 	spl_fstrans_unmark(cookie);
