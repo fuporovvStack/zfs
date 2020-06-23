@@ -309,8 +309,12 @@ arc_lowmem_init(void)
 	 */
 	spl_register_shrinker(&arc_shrinker);
 
-	/* Set to 1/64 of all memory or a minimum of 512K */
-	arc_sys_free = MAX(allmem / 64, (512 * 1024));
+	/*
+	 * The ARC tries to keep at least this much memory available for
+	 * the system.  This gives the ARC time to shrink in response to
+	 * memory pressure, before running completely out of memory.
+	 */
+	arc_sys_free = allmem / 32;
 	arc_need_free = 0;
 }
 
