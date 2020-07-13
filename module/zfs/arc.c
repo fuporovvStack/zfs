@@ -7855,8 +7855,14 @@ arc_init(void)
 	arc_need_free = 0;
 #endif
 
-	/* Set min cache to 1/32 of all memory, or 32MB, whichever is more */
-	arc_c_min = MAX(allmem / 32, 2ULL << SPA_MAXBLOCKSHIFT);
+	/*
+	 * Set min cache to 1/8 of all memory, or 32MB, whichever is more.
+	 * Note that this needs to be large enough to contain the entire dbuf
+	 * cache, plus the ARC's copy of this data.  By default the dbuf
+	 * cache is 3/64ths of memory (see dbuf_cache_shift), so this should
+	 * be at least 6/64ths of memory.
+	 */
+	arc_c_min = MAX(allmem / 8, 2ULL << SPA_MAXBLOCKSHIFT);
 	/* set max to 1/2 of all memory */
 	arc_c_max = MAX(allmem / 2, arc_c_min);
 
