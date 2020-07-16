@@ -179,7 +179,7 @@ arc_shrinker_count(struct shrinker *shrink, struct shrink_control *sc)
 		return (0);
 	}
 
-	return (btop((int64_t)arc_evictable_memory()));
+	return (MIN(100000, btop((int64_t)arc_evictable_memory())));
 }
 
 static unsigned long
@@ -216,6 +216,16 @@ arc_shrinker_scan(struct shrinker *shrink, struct shrink_control *sc)
 			    &arc_adjust_lock);
 			pages = pages - btop(arc_evictable_memory());
 #else
+			/* this does seem to be an improvement, if not
+			 * a fix for everything.  Before (without the timeout)
+			 * we would often see several-second waits.  Now
+			 * each wait is <8ms.  But we still sometimes
+			 * get lots of calls, due to decreasing "priority"
+			 * (doubling the number of calls each time).
+			 *
+			 * However, this change seems to make even "arcstat 1"
+			 * now hang for a few seconds during a shrink event.
+			 */
 			while (arc_evict_count < amt + ptob(sc->nr_to_scan)) {
 				int rc = cv_timedwait_hires(
 				    &arc_adjust_waiters_cv,
