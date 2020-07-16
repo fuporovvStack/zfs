@@ -324,6 +324,7 @@ zthr_t		*arc_adjust_zthr;
 kmutex_t		arc_adjust_lock;
 kcondvar_t	arc_adjust_waiters_cv;
 boolean_t	arc_adjust_needed = B_FALSE;
+uint64_t	arc_evict_count;
 
 /*
  * The number of headers to evict in arc_evict_state_impl() before
@@ -3981,6 +3982,7 @@ arc_evict_state_impl(multilist_t *ml, int idx, arc_buf_hdr_t *marker,
 			 * before arc_adjust_zthr sleeps.
 			 */
 			mutex_enter(&arc_adjust_lock);
+			arc_evict_count += evicted;
 			if (!arc_is_overflowing())
 				cv_signal(&arc_adjust_waiters_cv);
 			mutex_exit(&arc_adjust_lock);

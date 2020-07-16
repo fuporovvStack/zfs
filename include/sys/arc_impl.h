@@ -880,6 +880,7 @@ extern zthr_t		*arc_adjust_zthr;
 extern kmutex_t		arc_adjust_lock;
 extern kcondvar_t	arc_adjust_waiters_cv;
 extern boolean_t	arc_adjust_needed;
+extern uint64_t		arc_evict_count;
 extern kmutex_t arc_prune_mtx;
 extern list_t arc_prune_list;
 extern aggsum_t arc_size;

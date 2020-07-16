@@ -208,14 +208,29 @@ arc_shrinker_scan(struct shrinker *shrink, struct shrink_control *sc)
 		 */
 		mutex_enter(&arc_adjust_lock);
 		if (arc_is_overflowing()) {
+			uint64_t amt = arc_evict_count;
 			arc_adjust_needed = B_TRUE;
 			zthr_wakeup(arc_adjust_zthr);
+#if 0
 			(void) cv_wait(&arc_adjust_waiters_cv,
 			    &arc_adjust_lock);
+			pages = pages - btop(arc_evictable_memory());
+#else
+			while (arc_evict_count < amt + ptob(sc->nr_to_scan)) {
+				int rc = cv_timedwait_hires(
+				    &arc_adjust_waiters_cv,
+				    &arc_adjust_lock,
+				    MSEC2NSEC(1), MSEC2NSEC(1), 0);
+				if (rc != -1) {
+					/* CV was signaled before timeout */
+					break;
+				}
+			}
+			pages = btop(arc_evict_count - amt);
+#endif
 		}
 		mutex_exit(&arc_adjust_lock);
 
-		pages = pages - btop(arc_evictable_memory());
 		pages = MAX(pages, 0);
 	}
 
