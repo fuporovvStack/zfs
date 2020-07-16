@@ -215,8 +215,8 @@ arc_shrinker_scan(struct shrinker *shrink, struct shrink_control *sc)
 		}
 		mutex_exit(&arc_adjust_lock);
 
-		pages = MAX((int64_t)pages -
-		    (int64_t)btop(arc_evictable_memory()), 0);
+		pages = pages - btop(arc_evictable_memory());
+		pages = MAX(pages, 0);
 	}
 
 	/*
