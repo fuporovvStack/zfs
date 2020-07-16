@@ -325,6 +325,7 @@ kmutex_t		arc_adjust_lock;
 kcondvar_t	arc_adjust_waiters_cv;
 boolean_t	arc_adjust_needed = B_FALSE;
 uint64_t	arc_evict_count;
+uint64_t	arc_evict_next_wait;
 
 /*
  * The number of headers to evict in arc_evict_state_impl() before
@@ -5034,6 +5035,33 @@ arc_get_data_buf(arc_buf_hdr_t *hdr, uint64_t size, void *tag)
 	}
 }
 
+int zfs_arc_eviction_pct = 100;
+/*
+ * Wait for the specified amount of data to be evicted from the ARC,
+ * or for the ARC to no longer be full.
+ */
+void
+arc_wait_for_eviction(uint64_t amount)
+{
+	ASSERT(MUTEX_HELD(&arc_adjust_lock));
+
+	uint64_t waiting_for =
+	    MAX(arc_evict_next_wait, arc_evict_count) +
+	    amount * 100 / zfs_arc_eviction_pct;
+	arc_evict_next_wait = waiting_for;
+
+	while (arc_evict_count < waiting_for) {
+		int rc = cv_timedwait_hires(
+		    &arc_adjust_waiters_cv,
+		    &arc_adjust_lock,
+		    USEC2NSEC(100), USEC2NSEC(10), 0);
+		if (rc != -1) {
+			/* CV was signaled before timeout */
+			break;
+		}
+	}
+}
+
 /*
  * Allocate a block and return it to the caller. If we are hitting the
  * hard limit for the cache size, we must sleep, waiting for the eviction
@@ -5079,8 +5107,12 @@ arc_get_data_impl(arc_buf_hdr_t *hdr, uint64_t size, void *tag)
 		if (arc_is_overflowing()) {
 			arc_adjust_needed = B_TRUE;
 			zthr_wakeup(arc_adjust_zthr);
+#if 1
+			arc_wait_for_eviction(size);
+#else
 			(void) cv_wait(&arc_adjust_waiters_cv,
 			    &arc_adjust_lock);
+#endif
 		}
 		mutex_exit(&arc_adjust_lock);
 	}
@@ -10393,4 +10425,7 @@ ZFS_MODULE_PARAM_CALL(zfs_arc, zfs_arc_, dnode_limit_percent,
 
 ZFS_MODULE_PARAM(zfs_arc, zfs_arc_, dnode_reduce_percent, ULONG, ZMOD_RW,
 	"Percentage of excess dnodes to try to unpin");
+
+ZFS_MODULE_PARAM(zfs_arc, zfs_arc_, eviction_pct, INT, ZMOD_RW,
+	"Percentage of eviction to wait for");
 /* END CSTYLED */

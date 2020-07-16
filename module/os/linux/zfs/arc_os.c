@@ -212,6 +212,9 @@ arc_shrinker_scan(struct shrinker *shrink, struct shrink_control *sc)
 			arc_adjust_needed = B_TRUE;
 			zthr_wakeup(arc_adjust_zthr);
 #if 1
+			arc_wait_for_eviction(ptob(sc->nr_to_scan));
+			pages = btop(arc_evict_count - amt);
+#elif 0
 			(void) cv_wait(&arc_adjust_waiters_cv,
 			    &arc_adjust_lock);
 			pages = pages - btop(arc_evictable_memory());
