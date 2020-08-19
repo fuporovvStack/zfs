@@ -2936,6 +2936,74 @@ vdev_raidz_xlate(vdev_t *cvd, const range_seg64_t *in, range_seg64_t *res)
 	ASSERT3U(res->rs_end - res->rs_start, <=, in->rs_end - in->rs_start);
 }
 
+
+static void
+raidz_scratch_read_done(zio_t *zio)
+{
+	zio_nowait(zio_unique_parent(zio));
+}
+
+static void
+raidz_scratch_write_done(zio_t *zio)
+{
+	vdev_raidz_expand_t *vre = zio->io_private;
+
+	if (zio->io_error == 0)
+		vre->vre_scratch_devices++;
+
+	abd_free(zio->io_abd);
+
+	spa_config_exit(zio->io_spa, SCL_STATE, zio->io_spa);
+}
+
+static void
+raidz_scratch_object(spa_t *spa, vdev_raidz_expand_t *vre)
+{
+	(void)vre;
+
+	vdev_t *raidvd = vdev_lookup_top(spa, vre->vre_vdev_id);
+
+	for (int i = 0; i < raidvd->vdev_children - 1; i++) {
+		dmu_tx_t *tx =
+		    dmu_tx_create_dd(spa_get_dsl(spa)->dp_mos_dir);
+		VERIFY0(dmu_tx_assign(tx, TXG_WAIT));
+		uint64_t txg = dmu_tx_get_txg(tx);
+
+		spa_config_enter(spa, SCL_CONFIG, FTAG, RW_READER);
+		raidvd = vdev_lookup_top(spa, vre->vre_vdev_id);
+
+		int txgoff = dmu_tx_get_txg(tx) & TXG_MASK;
+
+		spa_config_enter(spa, SCL_STATE, spa, RW_READER);
+
+		zio_t *pio = spa->spa_txg_zio[txgoff];
+		abd_t *abd = abd_alloc_for_io(VDEV_BOOT_SIZE, B_FALSE);
+		zio_t *write_zio = zio_vdev_child_io(pio, NULL,
+		    raidvd->vdev_child[i],
+		    -VDEV_BOOT_SIZE,
+		    abd, VDEV_BOOT_SIZE,
+		    ZIO_TYPE_WRITE, ZIO_PRIORITY_REMOVAL,
+		    ZIO_FLAG_CANFAIL,
+		    raidz_scratch_write_done, vre);
+
+		zio_nowait(zio_vdev_child_io(write_zio, NULL,
+		    raidvd->vdev_child[i],
+		    0,
+		    abd, VDEV_BOOT_SIZE,
+		    ZIO_TYPE_READ, ZIO_PRIORITY_REMOVAL,
+		    ZIO_FLAG_CANFAIL,
+		    raidz_scratch_read_done, NULL));
+
+		dmu_tx_commit(tx);
+
+		spa_config_exit(spa, SCL_CONFIG, FTAG);
+		txg_wait_synced(spa->spa_dsl_pool, txg);
+	}
+
+	vdev_t *vd = vdev_lookup_top(spa, vre->vre_vdev_id);
+	vdev_config_dirty(vd);
+}
+
 static void
 raidz_reflow_sync(void *arg, dmu_tx_t *tx)
 {
@@ -2969,6 +3037,14 @@ raidz_reflow_sync(void *arg, dmu_tx_t *tx)
 	 * real offset from the MOS?  Or rely on ditto blocks?
 	 */
 	vdev_t *vd = vdev_lookup_top(spa, vre->vre_vdev_id);
+
+	/*
+	 * Invalidate scratch object on first vre_offset_phys update.
+	 * Enable first metaslab.
+	 */
+	vre->vre_scratch_devices = 0;
+	metaslab_enable(vd->vdev_ms[0], B_FALSE, B_FALSE);
+
 	vdev_config_dirty(vd);
 }
 
@@ -3055,7 +3131,7 @@ raidz_reflow_impl(vdev_t *vd, vdev_raidz_expand_t *vre, range_tree_t *rt,
 {
 	spa_t *spa = vd->vdev_spa;
 	int ashift = vd->vdev_top->vdev_ashift;
-	uint64_t offset, size;
+	uint64_t offset, roffset, size;
 
 	if (!range_tree_find_in(rt, 0, vd->vdev_top->vdev_asize,
 	    &offset, &size)) {
@@ -3141,9 +3217,12 @@ raidz_reflow_impl(vdev_t *vd, vdev_raidz_expand_t *vre, range_tree_t *rt,
 	    ZIO_FLAG_CANFAIL,
 	    raidz_reflow_write_done, rra);
 
+	roffset = (blkid / old_children) << ashift;
+	if (vre->vre_scratch_devices != 0)
+		roffset -= VDEV_BOOT_SIZE;
 	zio_nowait(zio_vdev_child_io(write_zio, NULL,
 	    vd->vdev_child[blkid % old_children],
-	    (blkid / old_children) << ashift,
+	    roffset,
 	    abd, length,
 	    ZIO_TYPE_READ, ZIO_PRIORITY_REMOVAL,
 	    ZIO_FLAG_CANFAIL,
@@ -3152,25 +3231,11 @@ raidz_reflow_impl(vdev_t *vd, vdev_raidz_expand_t *vre, range_tree_t *rt,
 	return (B_FALSE);
 }
 
-/* ARGSUSED */
-static boolean_t
-spa_raidz_expand_cb_check(void *arg, zthr_t *zthr)
-{
-	spa_t *spa = arg;
-
-	return (spa->spa_raidz_expand != NULL);
-}
-
-/* ARGSUSED */
 static void
-spa_raidz_expand_cb(void *arg, zthr_t *zthr)
+raidz_reflow(spa_t *spa, vdev_raidz_expand_t *vre)
 {
-	spa_t *spa = arg;
-	vdev_raidz_expand_t *vre = spa->spa_raidz_expand;
-
 	spa_config_enter(spa, SCL_CONFIG, FTAG, RW_READER);
 	vdev_t *raidvd = vdev_lookup_top(spa, vre->vre_vdev_id);
-
 	uint64_t guid = raidvd->vdev_guid;
 
 	for (uint64_t i = vre->vre_offset >> raidvd->vdev_ms_shift;
@@ -3311,8 +3376,42 @@ spa_raidz_expand_cb(void *arg, zthr_t *zthr)
 	} else {
 		txg_wait_synced(spa->spa_dsl_pool, 0);
 	}
+}
+
+/* ARGSUSED */
+static void
+spa_raidz_expand_cb(void *arg, zthr_t *zthr)
+{
+	spa_t *spa = arg;
+
+	vdev_raidz_expand_t *vre = spa->spa_raidz_expand;
+	vdev_t *raidvd = vdev_lookup_top(spa, vre->vre_vdev_id);
+
+	metaslab_t *msp = raidvd->vdev_ms[0];
+	ASSERT(raidvd->vdev_children*VDEV_BOOT_SIZE < msp->ms_size);
+	metaslab_disable(msp);
+
+	if (vre->vre_scratch_devices != raidvd->vdev_children - 1)
+		raidz_scratch_object(spa, vre);
+
+	/*
+	 * XXX Handle inconsistent or unavailable scratch object.
+	 */
+	ASSERT(vre->vre_scratch_devices ==
+	    raidvd->vdev_children - 1);
+
+	raidz_reflow(spa, vre);
 
 	spa->spa_raidz_expand = NULL;
+}
+
+/* ARGSUSED */
+static boolean_t
+spa_raidz_expand_cb_check(void *arg, zthr_t *zthr)
+{
+	spa_t *spa = arg;
+
+	return (spa->spa_raidz_expand != NULL);
 }
 
 void
@@ -3402,6 +3501,9 @@ vdev_raidz_config_generate(vdev_t *vd, nvlist_t *nv)
 		fnvlist_add_uint64(nv, ZPOOL_CONFIG_RAIDZ_EXPAND_OFFSET,
 		    vdrz->vn_vre.vre_offset_phys);
 	}
+
+	fnvlist_add_uint64(nv, ZPOOL_CONFIG_RAIDZ_EXPAND_SCROBJ,
+	    vdrz->vn_vre.vre_scratch_devices);
 }
 
 /*
@@ -3448,6 +3550,16 @@ vdev_raidz_get_tsd(spa_t *spa, nvlist_t *nv)
 		/*
 		 * vdev_load() will set spa_raidz_expand.
 		 */
+	}
+
+	if (nvlist_lookup_uint64(nv, ZPOOL_CONFIG_RAIDZ_EXPAND_SCROBJ,
+	    &vdrz->vn_vre.vre_scratch_devices) == 0) {
+		/*
+		 * XXX If we got inconsistent scratch object, assert for now.
+		 */
+		ASSERT(vdrz->vn_vre.vre_scratch_devices == 0 ||
+		    vdrz->vn_vre.vre_scratch_devices ==
+		    vdrz->vd_physical_width - 1);
 	}
 
 	if (nvlist_lookup_uint64(nv, ZPOOL_CONFIG_NPARITY,

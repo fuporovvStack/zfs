@@ -84,6 +84,11 @@ typedef struct vdev_raidz_expand {
 
 	uint64_t vre_offset_pertxg[TXG_SIZE];
 
+	/*
+	 * Scratch object built on top of this number of leaf devices.
+	 */
+	uint64_t vre_scratch_devices;
+
 	dsl_scan_state_t vre_state;
 	time_t vre_start_time;
 	time_t vre_end_time;

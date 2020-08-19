@@ -1346,6 +1346,16 @@ vdev_metaslab_init(vdev_t *vd, uint64_t txg)
 		}
 	}
 
+	/*
+	 * Disable first metaslab if raidz expansion scratch object exist.
+	 */
+	if (vd->vdev_ops == &vdev_raidz_ops) {
+		vdev_raidz_t *vdrz = (vdev_raidz_t *)vd->vdev_tsd;
+		if (vdrz->vd_physical_width - 1 ==
+		    vdrz->vn_vre.vre_scratch_devices)
+			metaslab_disable(vd->vdev_ms[0]);
+	}
+
 	if (txg == 0)
 		spa_config_enter(spa, SCL_ALLOC, FTAG, RW_WRITER);
 
