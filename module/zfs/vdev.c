@@ -1347,13 +1347,13 @@ vdev_metaslab_init(vdev_t *vd, uint64_t txg)
 	}
 
 	/*
-	 * Disable first metaslab if raidz expansion scratch object exist.
+	 * Disable metalsabs included to raidz scratch object.
 	 */
 	if (vd->vdev_ops == &vdev_raidz_ops) {
 		vdev_raidz_t *vdrz = (vdev_raidz_t *)vd->vdev_tsd;
 		if (vdrz->vd_physical_width - 1 ==
 		    vdrz->vn_vre.vre_scratch_devices)
-			metaslab_disable(vd->vdev_ms[0]);
+			raidz_disable_scratch_metaslabs(spa);
 	}
 
 	if (txg == 0)

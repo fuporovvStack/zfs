@@ -2949,7 +2949,7 @@ raidz_scratch_write_done(zio_t *zio)
 	vdev_raidz_expand_t *vre = zio->io_private;
 
 	if (zio->io_error == 0)
-		vre->vre_scratch_devices++;
+		atomic_inc_64(&vre->vre_scratch_devices);
 
 	abd_free(zio->io_abd);
 
@@ -2957,26 +2957,23 @@ raidz_scratch_write_done(zio_t *zio)
 }
 
 static void
-raidz_scratch_object(spa_t *spa, vdev_raidz_expand_t *vre)
+raidz_build_scratch_object(spa_t *spa)
 {
-	(void)vre;
-
+	vdev_raidz_expand_t *vre = spa->spa_raidz_expand;
 	vdev_t *raidvd = vdev_lookup_top(spa, vre->vre_vdev_id);
 
+	spa_config_exit(spa, SCL_CONFIG, FTAG);
+
 	for (int i = 0; i < raidvd->vdev_children - 1; i++) {
+
 		dmu_tx_t *tx =
 		    dmu_tx_create_dd(spa_get_dsl(spa)->dp_mos_dir);
 		VERIFY0(dmu_tx_assign(tx, TXG_WAIT));
 		uint64_t txg = dmu_tx_get_txg(tx);
 
-		spa_config_enter(spa, SCL_CONFIG, FTAG, RW_READER);
-		raidvd = vdev_lookup_top(spa, vre->vre_vdev_id);
-
-		int txgoff = dmu_tx_get_txg(tx) & TXG_MASK;
-
 		spa_config_enter(spa, SCL_STATE, spa, RW_READER);
 
-		zio_t *pio = spa->spa_txg_zio[txgoff];
+		zio_t *pio = spa->spa_txg_zio[txg & TXG_MASK];
 		abd_t *abd = abd_alloc_for_io(VDEV_BOOT_SIZE, B_FALSE);
 		zio_t *write_zio = zio_vdev_child_io(pio, NULL,
 		    raidvd->vdev_child[i],
@@ -2996,12 +2993,33 @@ raidz_scratch_object(spa_t *spa, vdev_raidz_expand_t *vre)
 
 		dmu_tx_commit(tx);
 
-		spa_config_exit(spa, SCL_CONFIG, FTAG);
 		txg_wait_synced(spa->spa_dsl_pool, txg);
 	}
 
+	spa_config_enter(spa, SCL_CONFIG, FTAG, RW_READER);
+}
+
+static void
+raidz_enable_scratch_metaslabs(spa_t *spa)
+{
+	vdev_raidz_expand_t *vre = spa->spa_raidz_expand;
 	vdev_t *vd = vdev_lookup_top(spa, vre->vre_vdev_id);
-	vdev_config_dirty(vd);
+
+	while (vre->vre_scratch_metaslabs_cnt >= 0)
+		metaslab_enable(vd->vdev_ms[vre->vre_scratch_metaslabs_cnt--],
+		    B_FALSE, B_FALSE);
+}
+
+void
+raidz_disable_scratch_metaslabs(spa_t *spa)
+{
+	vdev_raidz_expand_t *vre = spa->spa_raidz_expand;
+	vdev_t *vd = vdev_lookup_top(spa, vre->vre_vdev_id);
+
+	do {
+		metaslab_disable(vd->vdev_ms[vre->vre_scratch_metaslabs_cnt++]);
+	} while ((vd->vdev_children - 1) * VDEV_BOOT_SIZE >
+	    vre->vre_scratch_metaslabs_cnt * vd->vdev_ms[0]->ms_size);
 }
 
 static void
@@ -3039,11 +3057,13 @@ raidz_reflow_sync(void *arg, dmu_tx_t *tx)
 	vdev_t *vd = vdev_lookup_top(spa, vre->vre_vdev_id);
 
 	/*
-	 * Invalidate scratch object on first vre_offset_phys update.
-	 * Enable first metaslab.
+	 * Invalidate scratch object, enable all disabled metaslabs.
 	 */
-	vre->vre_scratch_devices = 0;
-	metaslab_enable(vd->vdev_ms[0], B_FALSE, B_FALSE);
+	if (vre->vre_scratch_devices &&
+	    vre->vre_offset_phys / vd->vdev_children > VDEV_BOOT_SIZE) {
+		vre->vre_scratch_devices = 0;
+		raidz_enable_scratch_metaslabs(spa);
+	}
 
 	vdev_config_dirty(vd);
 }
@@ -3231,12 +3251,22 @@ raidz_reflow_impl(vdev_t *vd, vdev_raidz_expand_t *vre, range_tree_t *rt,
 	return (B_FALSE);
 }
 
+/* ARGSUSED */
 static void
-raidz_reflow(spa_t *spa, vdev_raidz_expand_t *vre)
+spa_raidz_expand_cb(void *arg, zthr_t *zthr)
 {
+	spa_t *spa = arg;
+	vdev_raidz_expand_t *vre = spa->spa_raidz_expand;
+
 	spa_config_enter(spa, SCL_CONFIG, FTAG, RW_READER);
 	vdev_t *raidvd = vdev_lookup_top(spa, vre->vre_vdev_id);
 	uint64_t guid = raidvd->vdev_guid;
+
+	/* Build scratch object */
+	if (vre->vre_offset == 0) {
+		raidz_disable_scratch_metaslabs(spa);
+		raidz_build_scratch_object(spa);
+	}
 
 	for (uint64_t i = vre->vre_offset >> raidvd->vdev_ms_shift;
 	    i < raidvd->vdev_ms_count &&
@@ -3376,31 +3406,6 @@ raidz_reflow(spa_t *spa, vdev_raidz_expand_t *vre)
 	} else {
 		txg_wait_synced(spa->spa_dsl_pool, 0);
 	}
-}
-
-/* ARGSUSED */
-static void
-spa_raidz_expand_cb(void *arg, zthr_t *zthr)
-{
-	spa_t *spa = arg;
-
-	vdev_raidz_expand_t *vre = spa->spa_raidz_expand;
-	vdev_t *raidvd = vdev_lookup_top(spa, vre->vre_vdev_id);
-
-	metaslab_t *msp = raidvd->vdev_ms[0];
-	ASSERT(raidvd->vdev_children*VDEV_BOOT_SIZE < msp->ms_size);
-	metaslab_disable(msp);
-
-	if (vre->vre_scratch_devices != raidvd->vdev_children - 1)
-		raidz_scratch_object(spa, vre);
-
-	/*
-	 * XXX Handle inconsistent or unavailable scratch object.
-	 */
-	ASSERT(vre->vre_scratch_devices ==
-	    raidvd->vdev_children - 1);
-
-	raidz_reflow(spa, vre);
 
 	spa->spa_raidz_expand = NULL;
 }

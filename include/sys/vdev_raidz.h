@@ -88,6 +88,7 @@ typedef struct vdev_raidz_expand {
 	 * Scratch object built on top of this number of leaf devices.
 	 */
 	uint64_t vre_scratch_devices;
+	int64_t vre_scratch_metaslabs_cnt;
 
 	dsl_scan_state_t vre_state;
 	time_t vre_start_time;
@@ -108,6 +109,7 @@ typedef struct vdev_raidz {
 
 extern void vdev_raidz_attach_sync(void *, dmu_tx_t *);
 extern void vdev_raidz_config_generate(vdev_t *, nvlist_t *);
+extern void raidz_disable_scratch_metaslabs(spa_t *);
 extern void *vdev_raidz_get_tsd(spa_t *, nvlist_t *);
 extern void spa_start_raidz_expansion_thread(spa_t *);
 extern int spa_raidz_expand_get_stats(spa_t *, pool_raidz_expand_stat_t *);
