@@ -464,8 +464,8 @@ spa_checkpoint_check(void *arg, dmu_tx_t *tx)
 	if (spa->spa_removing_phys.sr_state == DSS_SCANNING)
 		return (SET_ERROR(ZFS_ERR_DEVRM_IN_PROGRESS));
 
-	if (spa_feature_is_active(spa, SPA_FEATURE_RAIDZ_EXPANSION))
-		return (SET_ERROR(ZFS_ERR_RAIDZ_EXPANSION));
+	if (spa->spa_raidz_expand != NULL)
+		return (SET_ERROR(ZFS_ERR_RAIDZ_EXPAND_IN_PROGRESS));
 
 	if (spa->spa_checkpoint_txg != 0)
 		return (SET_ERROR(ZFS_ERR_CHECKPOINT_EXISTS));

@@ -86,6 +86,8 @@ log_must zpool destroy $pool
 # case 2: expansion had place, try to checkpoint
 log_must zpool create -f $opts $pool $raid ${disks[1..$(($devs-1))]}
 log_must zfs set primarycache=metadata $pool
+log_must zfs create $pool/fs
+log_must fill_fs /$pool/fs 1 512 100 1024 R
 log_must zpool attach $pool ${raid}-0 ${disks[$devs]}
 log_mustnot zpool checkpoint $pool
 log_must zpool destroy $pool
