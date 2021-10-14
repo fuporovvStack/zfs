@@ -94,7 +94,7 @@ typedef enum raidz_reflow_scratch_state {
 	(ub)->ub_raidz_reflow_info = 0; \
 	RRSS_SET_OFFSET(ub, offset); \
 	RRSS_SET_STATE(ub, state); \
-_NOTE(CONSTCOND) } while (0)
+} while (0)
 
 struct uberblock {
 	uint64_t	ub_magic;	/* UBERBLOCK_MAGIC		*/

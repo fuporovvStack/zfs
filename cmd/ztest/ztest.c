@@ -4006,7 +4006,7 @@ ztest_vdev_raidz_attach(ztest_ds_t *zd, uint64_t id)
 		ztest_shared->zs_raidzs_attached++;
 	} else if (error != 0 && error != expected_error) {
 		fatal(0, "raidz attach (%s %llu) returned %d, expected %d",
-		    newpath, csize, error, expected_error);
+		    newpath, (long long)csize, error, expected_error);
 	} else if (error == 0 && ztest_shared->zs_do_raidz_scratch_verify) {
 		/*
 		 * Wait raidz expansion thread starting and kill it.
@@ -7874,7 +7874,7 @@ ztest_raidz_expand_run(ztest_shared_t *zs)
 		nvlist_free(root);
 		if (error != 0) {
 			fatal(0, "raidz expand: attach (%s %llu) returned %d",
-			    newpath, csize, error);
+			    newpath, (long long)csize, error);
 		}
 
 		/*
