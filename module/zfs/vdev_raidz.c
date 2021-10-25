@@ -4003,6 +4003,16 @@ spa_raidz_expand_cb(void *arg, zthr_t *zthr)
 	spa_t *spa = arg;
 	vdev_raidz_expand_t *vre = spa->spa_raidz_expand;
 
+#ifndef _KERNEL
+	/*
+	* XXX Workaround for ztest:
+	* It is possible to get assert failure under zthr_iscancelled(), which
+	* checks that input arg is not nullpointer. The sleep() above prevents
+	* this issue.
+	*/
+	sleep(1);
+#endif
+
 	ASSERT(vre->vre_offset == UINT64_MAX ||
 	    vre->vre_offset == RRSS_GET_OFFSET(&spa->spa_ubsync));
 	vre->vre_offset = RRSS_GET_OFFSET(&spa->spa_ubsync);
