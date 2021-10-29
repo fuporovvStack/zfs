@@ -1,533 +1,356 @@
 /*
- * CDDL HEADER START
- *
- * The contents of this file are subject to the terms of the
- * Common Development and Distribution License (the "License").
- * You may not use this file except in compliance with the License.
- *
- * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
- * See the License for the specific language governing permissions
- * and limitations under the License.
- *
- * When distributing Covered Code, include this CDDL HEADER in each
- * file and include the License file at usr/src/OPENSOLARIS.LICENSE.
- * If applicable, add the following below this CDDL HEADER, with the
- * fields enclosed by brackets "[]" replaced with your own identifying
- * information: Portions Copyright [yyyy] [name of copyright owner]
- *
- * CDDL HEADER END
- */
+ * COMMENT FROM ORIGINAL VERSION:
+Originally written by Jeff Bonwick
+(http://www.mail-archive.com/zfs-discuss@opensolaris.org/msg15748.html),
+and updated by James Lee to work with modern ZFS libs
+(https://www.mail-archive.com/zfs-discuss@opensolaris.org/msg47316.html),
+I was able to compile this life-saving utility in Ubuntu 14.04 and have verified
+that it works. (I'm using ZFSonLinux.) Download the ZFSonLinux tarball and
+replace the cmd/zhack/zhack.c file with "labelfix.c". Note that zhack is just a
+simple utility that we're replacing so that we don't have to setup the build
+environment. (It's hard, so we'll reuse the good work of the ZFSonLinux people.)
+Run "./configure; make" and if all goes well then the zfs tools will be built,
+except for zhack, which we replaced. Run that with the device path to recover
+your data. If you want to be super-careful and not tamper with your disk,
+you can clone it and run the utility on your clone. Or, create an overlay as
+described in this page:
+https://raid.wiki.kernel.org/index.php/Recovering_a_failed_software_RAID#Making_the_harddisks_read-only_using_an_overlay_file
+*/
 
 /*
- * Copyright (c) 2011, 2015 by Delphix. All rights reserved.
- * Copyright (c) 2013 Steven Hartland. All rights reserved.
+ * HOW TO BUILD:
+ * - copy/paste this file content to zhack.c
+ * - cd zfs && ./autogen.sh ; ./configure ; make ; sudo make install
+ * - cp $(which zhack) name_you_wish_this_utility_will_be_called
  */
 
-/*
- * zhack is a debugging tool that can write changes to ZFS pool using libzpool
- * for testing purposes. Altering pools with zhack is unsupported and may
- * result in corrupted pools.
- */
-
-#include <stdio.h>
+#include <dirent.h>
+#include <errno.h>
 #include <stdlib.h>
-#include <ctype.h>
-#include <sys/zfs_context.h>
-#include <sys/spa.h>
-#include <sys/spa_impl.h>
-#include <sys/dmu.h>
-#include <sys/zap.h>
-#include <sys/zfs_znode.h>
-#include <sys/dsl_synctask.h>
-#include <sys/vdev.h>
-#include <sys/fs/zfs.h>
-#include <sys/dmu_objset.h>
-#include <sys/dsl_pool.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <stddef.h>
+
 #include <sys/zio_checksum.h>
-#include <sys/zio_compress.h>
-#include <sys/zfeature.h>
-#include <sys/dmu_tx.h>
-#include <zfeature_common.h>
-#include <libzutil.h>
+#include <sys/vdev_impl.h>
 
-const char cmdname[] = "zhack";
-static importargs_t g_importargs;
-static char *g_pool;
-static boolean_t g_readonly;
+#include <libnvpair.h>
 
-static __attribute__((noreturn)) void
-usage(void)
+static uint64_t
+label_get_offset(uint64_t psize, int l)
 {
-	(void) fprintf(stderr,
-	    "Usage: %s [-c cachefile] [-d dir] <subcommand> <args> ...\n"
-	    "where <subcommand> <args> is one of the following:\n"
-	    "\n", cmdname);
+	return (l * sizeof (vdev_label_t) + (l < VDEV_LABELS / 2 ?
+	    0 : psize - VDEV_LABELS * sizeof (vdev_label_t)));
+}
 
-	(void) fprintf(stderr,
-	    "    feature stat <pool>\n"
-	    "        print information about enabled features\n"
-	    "    feature enable [-r] [-d desc] <pool> <feature>\n"
-	    "        add a new enabled feature to the pool\n"
-	    "        -d <desc> sets the feature's description\n"
-	    "        -r set read-only compatible flag for feature\n"
-	    "    feature ref [-md] <pool> <feature>\n"
-	    "        change the refcount on the given feature\n"
-	    "        -d decrease instead of increase the refcount\n"
-	    "        -m add the feature to the label if increasing refcount\n"
-	    "\n"
-	    "    <feature> : should be a feature guid\n");
-	exit(1);
+static boolean_t
+label_dump_csum(int l, vdev_label_t *vl, uint64_t label_offset)
+{
+	zio_checksum_info_t *ci = &zio_checksum_table[ZIO_CHECKSUM_LABEL];
+	zio_cksum_t expected_cksum;
+	zio_cksum_t actual_cksum;
+	zio_cksum_t verifier;
+	zio_eck_t *eck;
+	uint64_t size = VDEV_PHYS_SIZE;
+	int byteswap;
+
+	void *data = (char *)vl + offsetof(vdev_label_t, vl_vdev_phys);
+	eck = (zio_eck_t *)((char *)(data) + size) - 1;
+
+	if ((eck->zec_magic != ZEC_MAGIC) &&
+	    (eck->zec_magic != BSWAP_64(ZEC_MAGIC)))
+		ASSERT(!"Bad csum magic on label read");
+
+	uint64_t offset = label_offset + offsetof(vdev_label_t, vl_vdev_phys);
+	ZIO_SET_CHECKSUM(&verifier, offset, 0, 0, 0);
+
+	byteswap = (eck->zec_magic == BSWAP_64(ZEC_MAGIC));
+	if (byteswap)
+		byteswap_uint64_array(&verifier, sizeof (zio_cksum_t));
+
+	expected_cksum = eck->zec_cksum;
+	eck->zec_cksum = verifier;
+
+	abd_t *abd = abd_get_from_buf(data, size);
+	ci->ci_func[byteswap](abd, size, NULL, &actual_cksum);
+
+	if (byteswap)
+		byteswap_uint64_array(&expected_cksum,
+		    sizeof (zio_cksum_t));
+
+	if (ZIO_CHECKSUM_EQUAL(actual_cksum, expected_cksum))
+		return (B_TRUE);
+
+	return (B_FALSE);
 }
 
 
-static __attribute__((noreturn)) __attribute__((format(printf, 3, 4))) void
-fatal(spa_t *spa, void *tag, const char *fmt, ...)
+static uint64_t
+label_read(const char *path, int l, vdev_label_t *vl)
 {
-	va_list ap;
+	int fd;
+	struct stat st;
+	uint64_t psize, offset;
 
-	if (spa != NULL) {
-		spa_close(spa, tag);
-		(void) spa_export(g_pool, NULL, B_TRUE, B_FALSE);
-	}
+	VERIFY((fd = open(path, O_RDWR)) != -1);
+	VERIFY(stat(path, &st) == 0);
+	psize = st.st_size;
+	offset = label_get_offset(psize, l);
 
-	va_start(ap, fmt);
-	(void) fprintf(stderr, "%s: ", cmdname);
-	(void) vfprintf(stderr, fmt, ap);
-	va_end(ap);
-	(void) fprintf(stderr, "\n");
+	VERIFY(pread64(fd, vl, sizeof (vdev_label_t), offset) ==
+	    sizeof (vdev_label_t));
 
-	exit(1);
+	close(fd);
+
+	return (offset);
 }
 
-/* ARGSUSED */
-static int
-space_delta_cb(dmu_object_type_t bonustype, const void *data,
-    zfs_file_info_t *zoi)
+static uint64_t
+label_mask(const char *arg)
 {
-	/*
-	 * Is it a valid type of object to track?
-	 */
-	if (bonustype != DMU_OT_ZNODE && bonustype != DMU_OT_SA)
-		return (ENOENT);
-	(void) fprintf(stderr, "modifying object that needs user accounting");
-	abort();
+	int mask = 0;
+
+	for (int i = 0; i < VDEV_LABELS; i++)
+		if (arg[i] != '0')
+			mask |= 1 << i;
+
+	return (mask);
 }
 
-/*
- * Target is the dataset whose pool we want to open.
- */
 static void
-zhack_import(char *target, boolean_t readonly)
+label_dump(vdev_label_t *vl)
 {
 	nvlist_t *config;
-	nvlist_t *props;
-	int error;
 
-	kernel_init(readonly ? SPA_MODE_READ :
-	    (SPA_MODE_READ | SPA_MODE_WRITE));
+	VERIFY(nvlist_unpack(vl->vl_vdev_phys.vp_nvlist,
+	    sizeof (vl->vl_vdev_phys.vp_nvlist), &config, 0) == 0);
 
-	dmu_objset_register_type(DMU_OST_ZFS, space_delta_cb);
-
-	g_readonly = readonly;
-	g_importargs.can_be_active = readonly;
-	g_pool = strdup(target);
-
-	error = zpool_find_config(NULL, target, &config, &g_importargs,
-	    &libzpool_config_ops);
-	if (error)
-		fatal(NULL, FTAG, "cannot import '%s'", target);
-
-	props = NULL;
-	if (readonly) {
-		VERIFY(nvlist_alloc(&props, NV_UNIQUE_NAME, 0) == 0);
-		VERIFY(nvlist_add_uint64(props,
-		    zpool_prop_to_name(ZPOOL_PROP_READONLY), 1) == 0);
-	}
-
-	zfeature_checks_disable = B_TRUE;
-	error = spa_import(target, config, props,
-	    (readonly ?  ZFS_IMPORT_SKIP_MMP : ZFS_IMPORT_NORMAL));
-	fnvlist_free(config);
-	zfeature_checks_disable = B_FALSE;
-	if (error == EEXIST)
-		error = 0;
-
-	if (error)
-		fatal(NULL, FTAG, "can't import '%s': %s", target,
-		    strerror(error));
+	dump_nvlist(config, 8);
 }
 
 static void
-zhack_spa_open(char *target, boolean_t readonly, void *tag, spa_t **spa)
+label_update_int_key(nvlist_t *config, const char *key, uint64_t val)
 {
-	int err;
-
-	zhack_import(target, readonly);
-
-	zfeature_checks_disable = B_TRUE;
-	err = spa_open(target, spa, tag);
-	zfeature_checks_disable = B_FALSE;
-
-	if (err != 0)
-		fatal(*spa, FTAG, "cannot open '%s': %s", target,
-		    strerror(err));
-	if (spa_version(*spa) < SPA_VERSION_FEATURES) {
-		fatal(*spa, FTAG, "'%s' has version %d, features not enabled",
-		    target, (int)spa_version(*spa));
-	}
-}
-
-static void
-dump_obj(objset_t *os, uint64_t obj, const char *name)
-{
-	zap_cursor_t zc;
-	zap_attribute_t za;
-
-	(void) printf("%s_obj:\n", name);
-
-	for (zap_cursor_init(&zc, os, obj);
-	    zap_cursor_retrieve(&zc, &za) == 0;
-	    zap_cursor_advance(&zc)) {
-		if (za.za_integer_length == 8) {
-			ASSERT(za.za_num_integers == 1);
-			(void) printf("\t%s = %llu\n",
-			    za.za_name, (u_longlong_t)za.za_first_integer);
-		} else {
-			ASSERT(za.za_integer_length == 1);
-			char val[1024];
-			VERIFY(zap_lookup(os, obj, za.za_name,
-			    1, sizeof (val), val) == 0);
-			(void) printf("\t%s = %s\n", za.za_name, val);
-		}
-	}
-	zap_cursor_fini(&zc);
-}
-
-static void
-dump_mos(spa_t *spa)
-{
-	nvlist_t *nv = spa->spa_label_features;
-	nvpair_t *pair;
-
-	(void) printf("label config:\n");
-	for (pair = nvlist_next_nvpair(nv, NULL);
-	    pair != NULL;
-	    pair = nvlist_next_nvpair(nv, pair)) {
-		(void) printf("\t%s\n", nvpair_name(pair));
-	}
-}
-
-static void
-zhack_do_feature_stat(int argc, char **argv)
-{
-	spa_t *spa;
-	objset_t *os;
-	char *target;
-
-	argc--;
-	argv++;
-
-	if (argc < 1) {
-		(void) fprintf(stderr, "error: missing pool name\n");
-		usage();
-	}
-	target = argv[0];
-
-	zhack_spa_open(target, B_TRUE, FTAG, &spa);
-	os = spa->spa_meta_objset;
-
-	dump_obj(os, spa->spa_feat_for_read_obj, "for_read");
-	dump_obj(os, spa->spa_feat_for_write_obj, "for_write");
-	dump_obj(os, spa->spa_feat_desc_obj, "descriptions");
-	if (spa_feature_is_active(spa, SPA_FEATURE_ENABLED_TXG)) {
-		dump_obj(os, spa->spa_feat_enabled_txg_obj, "enabled_txg");
-	}
-	dump_mos(spa);
-
-	spa_close(spa, FTAG);
-}
-
-static void
-zhack_feature_enable_sync(void *arg, dmu_tx_t *tx)
-{
-	spa_t *spa = dmu_tx_pool(tx)->dp_spa;
-	zfeature_info_t *feature = arg;
-
-	feature_enable_sync(spa, feature, tx);
-
-	spa_history_log_internal(spa, "zhack enable feature", tx,
-	    "name=%s flags=%u",
-	    feature->fi_guid, feature->fi_flags);
-}
-
-static void
-zhack_do_feature_enable(int argc, char **argv)
-{
-	int c;
-	char *desc, *target;
-	spa_t *spa;
-	objset_t *mos;
-	zfeature_info_t feature;
-	spa_feature_t nodeps[] = { SPA_FEATURE_NONE };
-
-	/*
-	 * Features are not added to the pool's label until their refcounts
-	 * are incremented, so fi_mos can just be left as false for now.
-	 */
-	desc = NULL;
-	feature.fi_uname = "zhack";
-	feature.fi_flags = 0;
-	feature.fi_depends = nodeps;
-	feature.fi_feature = SPA_FEATURE_NONE;
-
-	optind = 1;
-	while ((c = getopt(argc, argv, "+rd:")) != -1) {
-		switch (c) {
-		case 'r':
-			feature.fi_flags |= ZFEATURE_FLAG_READONLY_COMPAT;
-			break;
-		case 'd':
-			desc = strdup(optarg);
-			break;
-		default:
-			usage();
-			break;
-		}
-	}
-
-	if (desc == NULL)
-		desc = strdup("zhack injected");
-	feature.fi_desc = desc;
-
-	argc -= optind;
-	argv += optind;
-
-	if (argc < 2) {
-		(void) fprintf(stderr, "error: missing feature or pool name\n");
-		usage();
-	}
-	target = argv[0];
-	feature.fi_guid = argv[1];
-
-	if (!zfeature_is_valid_guid(feature.fi_guid))
-		fatal(NULL, FTAG, "invalid feature guid: %s", feature.fi_guid);
-
-	zhack_spa_open(target, B_FALSE, FTAG, &spa);
-	mos = spa->spa_meta_objset;
-
-	if (zfeature_is_supported(feature.fi_guid))
-		fatal(spa, FTAG, "'%s' is a real feature, will not enable",
-		    feature.fi_guid);
-	if (0 == zap_contains(mos, spa->spa_feat_desc_obj, feature.fi_guid))
-		fatal(spa, FTAG, "feature already enabled: %s",
-		    feature.fi_guid);
-
-	VERIFY0(dsl_sync_task(spa_name(spa), NULL,
-	    zhack_feature_enable_sync, &feature, 5, ZFS_SPACE_CHECK_NORMAL));
-
-	spa_close(spa, FTAG);
-
-	free(desc);
-}
-
-static void
-feature_incr_sync(void *arg, dmu_tx_t *tx)
-{
-	spa_t *spa = dmu_tx_pool(tx)->dp_spa;
-	zfeature_info_t *feature = arg;
-	uint64_t refcount;
-
-	VERIFY0(feature_get_refcount_from_disk(spa, feature, &refcount));
-	feature_sync(spa, feature, refcount + 1, tx);
-	spa_history_log_internal(spa, "zhack feature incr", tx,
-	    "name=%s", feature->fi_guid);
-}
-
-static void
-feature_decr_sync(void *arg, dmu_tx_t *tx)
-{
-	spa_t *spa = dmu_tx_pool(tx)->dp_spa;
-	zfeature_info_t *feature = arg;
-	uint64_t refcount;
-
-	VERIFY0(feature_get_refcount_from_disk(spa, feature, &refcount));
-	feature_sync(spa, feature, refcount - 1, tx);
-	spa_history_log_internal(spa, "zhack feature decr", tx,
-	    "name=%s", feature->fi_guid);
-}
-
-static void
-zhack_do_feature_ref(int argc, char **argv)
-{
-	int c;
-	char *target;
-	boolean_t decr = B_FALSE;
-	spa_t *spa;
-	objset_t *mos;
-	zfeature_info_t feature;
-	spa_feature_t nodeps[] = { SPA_FEATURE_NONE };
-
-	/*
-	 * fi_desc does not matter here because it was written to disk
-	 * when the feature was enabled, but we need to properly set the
-	 * feature for read or write based on the information we read off
-	 * disk later.
-	 */
-	feature.fi_uname = "zhack";
-	feature.fi_flags = 0;
-	feature.fi_desc = NULL;
-	feature.fi_depends = nodeps;
-	feature.fi_feature = SPA_FEATURE_NONE;
-
-	optind = 1;
-	while ((c = getopt(argc, argv, "+md")) != -1) {
-		switch (c) {
-		case 'm':
-			feature.fi_flags |= ZFEATURE_FLAG_MOS;
-			break;
-		case 'd':
-			decr = B_TRUE;
-			break;
-		default:
-			usage();
-			break;
-		}
-	}
-	argc -= optind;
-	argv += optind;
-
-	if (argc < 2) {
-		(void) fprintf(stderr, "error: missing feature or pool name\n");
-		usage();
-	}
-	target = argv[0];
-	feature.fi_guid = argv[1];
-
-	if (!zfeature_is_valid_guid(feature.fi_guid))
-		fatal(NULL, FTAG, "invalid feature guid: %s", feature.fi_guid);
-
-	zhack_spa_open(target, B_FALSE, FTAG, &spa);
-	mos = spa->spa_meta_objset;
-
-	if (zfeature_is_supported(feature.fi_guid)) {
-		fatal(spa, FTAG,
-		    "'%s' is a real feature, will not change refcount",
-		    feature.fi_guid);
-	}
-
-	if (0 == zap_contains(mos, spa->spa_feat_for_read_obj,
-	    feature.fi_guid)) {
-		feature.fi_flags &= ~ZFEATURE_FLAG_READONLY_COMPAT;
-	} else if (0 == zap_contains(mos, spa->spa_feat_for_write_obj,
-	    feature.fi_guid)) {
-		feature.fi_flags |= ZFEATURE_FLAG_READONLY_COMPAT;
+	uint64_t ret;
+	int err = nvlist_lookup_uint64(config, key, &ret);
+	if (err == 0) {
+		VERIFY(nvlist_remove_all(config, key) == 0);
+		VERIFY(nvlist_add_uint64(config, key, val) == 0);
 	} else {
-		fatal(spa, FTAG, "feature is not enabled: %s", feature.fi_guid);
+		VERIFY(nvlist_add_uint64(config, key, val) == 0);
 	}
-
-	if (decr) {
-		uint64_t count;
-		if (feature_get_refcount_from_disk(spa, &feature,
-		    &count) == 0 && count == 0) {
-			fatal(spa, FTAG, "feature refcount already 0: %s",
-			    feature.fi_guid);
-		}
-	}
-
-	VERIFY0(dsl_sync_task(spa_name(spa), NULL,
-	    decr ? feature_decr_sync : feature_incr_sync, &feature,
-	    5, ZFS_SPACE_CHECK_NORMAL));
-
-	spa_close(spa, FTAG);
 }
 
-static int
-zhack_do_feature(int argc, char **argv)
+static void
+label_update_string_key(nvlist_t *config, const char *key, const char *val)
 {
-	char *subcommand;
-
-	argc--;
-	argv++;
-	if (argc == 0) {
-		(void) fprintf(stderr,
-		    "error: no feature operation specified\n");
-		usage();
-	}
-
-	subcommand = argv[0];
-	if (strcmp(subcommand, "stat") == 0) {
-		zhack_do_feature_stat(argc, argv);
-	} else if (strcmp(subcommand, "enable") == 0) {
-		zhack_do_feature_enable(argc, argv);
-	} else if (strcmp(subcommand, "ref") == 0) {
-		zhack_do_feature_ref(argc, argv);
+	char *ret;
+	int err = nvlist_lookup_string(config, key, &ret);
+	if (err == 0) {
+		VERIFY(nvlist_remove_all(config, key) == 0);
+		VERIFY(nvlist_add_string(config, key, val) == 0);
 	} else {
-		(void) fprintf(stderr, "error: unknown subcommand: %s\n",
-		    subcommand);
-		usage();
+		VERIFY(nvlist_add_string(config, key, val) == 0);
 	}
-
-	return (0);
 }
 
-#define	MAX_NUM_PATHS 1024
+static void
+label_write(const char *path, int l, vdev_label_t *vl,
+    boolean_t randomize_csum, boolean_t zero_csum)
+{
+	zio_checksum_info_t *ci = &zio_checksum_table[ZIO_CHECKSUM_LABEL];
+	int fd;
+	struct stat st;
+	uint64_t psize, offset;
+	zio_eck_t *eck;
+	zio_cksum_t zc;
+	abd_t *abd = NULL;
+	uint64_t size = VDEV_PHYS_SIZE;
+	int byteswap;
+
+	VERIFY((fd = open(path, O_RDWR)) != -1);
+	VERIFY(stat(path, &st) == 0);
+	psize = st.st_size;
+	offset = label_get_offset(psize, l);
+
+	void *data = (char *)vl + offsetof(vdev_label_t, vl_vdev_phys);
+	offset = offset + offsetof(vdev_label_t, vl_vdev_phys);
+	eck = (zio_eck_t *)((char *)(data) + size) - 1;
+
+	if ((eck->zec_magic != ZEC_MAGIC) &&
+	    (eck->zec_magic != BSWAP_64(ZEC_MAGIC)))
+		ASSERT(!"Bad csum magic on label write");
+
+	if (randomize_csum) {
+		ZIO_SET_CHECKSUM(&eck->zec_cksum, rand(), rand(), rand(),
+		    rand());
+	} else if (zero_csum) {
+		ZIO_SET_CHECKSUM(&eck->zec_cksum, 0, 0, 0, 0);
+	} else {
+		byteswap = (eck->zec_magic == BSWAP_64(ZEC_MAGIC));
+
+		abd = abd_get_from_buf(data, size);
+		ci->ci_func[byteswap](abd, size, NULL, &zc);
+		if (byteswap)
+			byteswap_uint64_array(&zc, sizeof (zio_cksum_t));
+
+		eck->zec_cksum = zc;
+	}
+
+	VERIFY(pwrite64(fd, data, size, offset) == size);
+
+	fsync(fd);
+	close(fd);
+}
+
+
+static void
+usage(void)
+{
+	printf("ZFS device labels modification utility.\n");
+	printf("CLI options:\n");
+	printf("-l: labels mask to process.\n");
+	printf("    Example: -l 0101, to modify second and last labels\n");
+	printf("-r: randomize requested labels csum.\n");
+	printf("-z: zero reqested labels csum.\n");
+	printf("-k -i/-s: add/update label config values.\n");
+	printf("    Example: '-k pool_guid -i 100500' or '-k name -s test'\n");
+	printf("-d: delete lavel config values.\n");
+	printf("    Example: '-k pool_guid -d\n");
+	printf("Usage example:\n");
+	printf("    util -l 1000 /path/to/zfs/dev\n");
+
+	exit(0);
+}
 
 int
 main(int argc, char **argv)
 {
-	extern void zfs_prop_init(void);
-
-	char *path[MAX_NUM_PATHS];
-	const char *subcommand;
-	int rv = 0;
 	int c;
+	int randomize_csum = 0;
+	int zero_csum = 0;
+	char *dev = NULL, *resolved_dev = NULL;
+	char resolved_path[PATH_MAX];
+	char *key = NULL, *val_str = NULL;
+	uint64_t val_int = 0;
+	boolean_t delete_key = B_FALSE;
+	uint64_t labels_mask = 0;
+	vdev_label_t labels[4] = {0};
+	nvlist_t *configs[VDEV_LABELS];
 
-	g_importargs.path = path;
+	dev = argv[argc-1];
 
-	dprintf_setup(&argc, argv);
-	zfs_prop_init();
-
-	while ((c = getopt(argc, argv, "+c:d:")) != -1) {
-		switch (c) {
-		case 'c':
-			g_importargs.cachefile = optarg;
-			break;
-		case 'd':
-			assert(g_importargs.paths < MAX_NUM_PATHS);
-			g_importargs.path[g_importargs.paths++] = optarg;
-			break;
-		default:
-			usage();
-			break;
+	while ((c = getopt (argc, argv, "dhi:k:l:rs:z")) != -1) {
+		switch (c)
+		{
+			case 'd':
+				delete_key = B_TRUE;
+				break;
+			case 'h':
+				usage();
+				break;
+			case 'i':
+				val_int = atoll(optarg);
+				break;
+			case 'k':
+				key = malloc(PATH_MAX);
+				strcpy(key, optarg);
+				break;
+			case 'l':
+				labels_mask = label_mask(optarg);
+				break;
+			case 'r':
+				randomize_csum = 1;
+				break;
+			case 's':
+				val_str = malloc(PATH_MAX);
+				strcpy(val_str, optarg);
+				break;
+			case 'z':
+				zero_csum = 1;
+				break;
+			case '?':
+			default:
+				usage();
 		}
 	}
 
-	argc -= optind;
-	argv += optind;
-	optind = 1;
-
-	if (argc == 0) {
-		(void) fprintf(stderr, "error: no command specified\n");
-		usage();
+	/*
+	 * Arguments validation.
+	 */
+	resolved_dev = realpath(dev, resolved_path);
+	if (resolved_dev == NULL) {
+		printf("Cannot get access to zfs device: %s\n", dev);
+		exit(1);
 	}
 
-	subcommand = argv[0];
-
-	if (strcmp(subcommand, "feature") == 0) {
-		rv = zhack_do_feature(argc, argv);
-	} else {
-		(void) fprintf(stderr, "error: unknown subcommand: %s\n",
-		    subcommand);
-		usage();
+	if (labels_mask == 0) {
+		printf("No zfs device labels to process\n");
+		exit(1);
 	}
 
-	if (!g_readonly && spa_export(g_pool, NULL, B_TRUE, B_FALSE) != 0) {
-		fatal(NULL, FTAG, "pool export failed; "
-		    "changes may not be committed to disk\n");
+	if (randomize_csum && zero_csum) {
+		printf("Cannot both randomize and zero csum\n");
+		exit(1);
 	}
 
-	kernel_fini();
+	abd_init();
 
-	return (rv);
+	for (int i = 0; i < VDEV_LABELS; i++) {
+		if ((labels_mask & (1 << i)) == 0)
+			continue;
+
+		uint64_t label_offset = label_read(dev, i, &labels[i]);
+
+		if(label_dump_csum(i, &labels[i], label_offset))
+			printf("==== label: %d\n", i);
+		else
+			printf("==== label: %d -> BAD csum\n", i);
+
+		label_dump(&labels[i]);
+	}
+
+	if (key) {
+		for (int i = 0; i < VDEV_LABELS; i++) {
+			if ((labels_mask & (1 << i)) == 0)
+				continue;
+
+			VERIFY(nvlist_unpack(labels[i].vl_vdev_phys.vp_nvlist,
+			    sizeof (labels[i].vl_vdev_phys.vp_nvlist),
+			    &configs[i], 0) == 0);
+
+			if (delete_key) {
+				VERIFY(nvlist_remove_all(configs[i], key) == 0);
+			} else {
+				if (val_str == NULL)
+					label_update_int_key(configs[i], key,
+					    val_int);
+				else
+					label_update_string_key(configs[i], key,
+					    val_str);
+			}
+
+			char *buf = labels[i].vl_vdev_phys.vp_nvlist;
+			uint64_t buflen = sizeof (labels[i].vl_vdev_phys.vp_nvlist);
+			VERIFY(nvlist_pack(configs[i], &buf, &buflen,
+			    NV_ENCODE_XDR, 0) == 0);
+		}
+	}
+
+	if (key == NULL && randomize_csum == 0 && zero_csum == 0)
+		goto out;
+
+	for (int i = 0; i < VDEV_LABELS; i++) {
+		if (labels_mask & (1 << i)) {
+			label_write(dev, i, &labels[i], randomize_csum, zero_csum);
+		}
+	}
+
+out:
+	abd_fini();
+
+	return (0);
 }
+
