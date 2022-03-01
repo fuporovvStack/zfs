@@ -3923,7 +3923,7 @@ raidz_reflow_scratch_sync(void *arg, dmu_tx_t *tx)
 	    (long long)logical_size,
 	    (long long)spa->spa_ubsync.ub_timestamp);
 
-	raidz_expand_pause(spa, 4);
+	raidz_expand_pause(spa, RAIDZ_EXPAND_PAUSE_SCRATCH_VALID);
 
 	/*
 	 * Overwrite with reflow'ed data.
@@ -3954,7 +3954,7 @@ raidz_reflow_scratch_sync(void *arg, dmu_tx_t *tx)
 		abd_free(abds[i]);
 	kmem_free(abds, raidvd->vdev_children * sizeof (abd_t *));
 
-	raidz_expand_pause(spa, 5);
+	raidz_expand_pause(spa, RAIDZ_EXPAND_PAUSE_SCRATCH_REFLOWED);
 
 	/*
 	 * Update uberblock to indicate that the initial part has been
@@ -4102,7 +4102,7 @@ vdev_raidz_reflow_copy_scratch(spa_t *spa)
 
 	spa_config_exit(spa, SCL_STATE, FTAG);
 
-	raidz_expand_pause(spa, 11);
+	raidz_expand_pause(spa, RAIDZ_EXPAND_PAUSE_SCRATCH_NOT_IN_USE);
 }
 
 /* ARGSUSED */

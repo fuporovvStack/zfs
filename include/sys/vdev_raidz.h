@@ -156,6 +156,13 @@ extern void vdev_raidz_attach_sync(void *, dmu_tx_t *);
 extern void spa_start_raidz_expansion_thread(spa_t *);
 extern int spa_raidz_expand_get_stats(spa_t *, pool_raidz_expand_stat_t *);
 extern int vdev_raidz_load(vdev_t *);
+
+/* Some of raidz scratch area states */
+#define RAIDZ_EXPAND_PAUSE_NONE	0
+#define RAIDZ_EXPAND_PAUSE_SCRATCH_VALID 4
+#define RAIDZ_EXPAND_PAUSE_SCRATCH_REFLOWED 5
+#define RAIDZ_EXPAND_PAUSE_SCRATCH_NOT_IN_USE 11
+
 #ifdef	__cplusplus
 }
 #endif

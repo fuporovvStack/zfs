@@ -278,7 +278,7 @@ static ztest_shared_ds_t *ztest_shared_ds;
 #define	ZTEST_GET_SHARED_DS(d) (&ztest_shared_ds[d])
 
 typedef struct ztest_scratch_state {
-	boolean_t	zs_do_raidz_scratch_verify;
+	uint64_t	zs_raidz_scratch_verify_pause;
 } ztest_shared_scratch_state_t;
 
 static ztest_shared_scratch_state_t *ztest_scratch_state;
@@ -1258,9 +1258,28 @@ ztest_kill(ztest_shared_t *zs)
 	 * Before we kill off ztest, make sure that the config is updated.
 	 * See comment above spa_write_cachefile().
 	 */
-	mutex_enter(&spa_namespace_lock);
-	spa_write_cachefile(ztest_spa, B_FALSE, B_FALSE);
-	mutex_exit(&spa_namespace_lock);
+	if (raidz_expand_max_offset_pause) {
+		if (mutex_tryenter(&spa_namespace_lock)) {
+			spa_write_cachefile(ztest_spa, B_FALSE, B_FALSE);
+			mutex_exit(&spa_namespace_lock);
+
+			ztest_scratch_state->zs_raidz_scratch_verify_pause =
+			    raidz_expand_max_offset_pause;
+		} else {
+			/*
+			 * Do not verify scratch object in case if
+			 * spa_namespace_lock cannot be acquired,
+			 * it can cause deadlock in spa_config_update().
+			 */
+			raidz_expand_max_offset_pause = 0;
+
+			return;
+		}
+	} else {
+		mutex_enter(&spa_namespace_lock);
+		spa_write_cachefile(ztest_spa, B_FALSE, B_FALSE);
+		mutex_exit(&spa_namespace_lock);
+	}
 
 	(void) kill(getpid(), SIGKILL);
 }
@@ -3928,25 +3947,48 @@ out:
 	umem_free(newpath, MAXPATHLEN);
 }
 
-#define	RAIDZ_REFLOW_OFFSET_PAUSE	4
-
 static void
 raidz_scratch_verify(void)
 {
 	spa_t *spa;
+	uint64_t pause, offset;
+	raidz_reflow_scratch_state_t state;
 
-	if (ztest_scratch_state->zs_do_raidz_scratch_verify == B_FALSE)
+	ASSERT(raidz_expand_max_offset_pause == 0);
+
+	if (ztest_scratch_state->zs_raidz_scratch_verify_pause == 0)
 		return;
 
 	kernel_init(SPA_MODE_READ);
+
+	mutex_enter(&spa_namespace_lock);
+	spa = spa_lookup(ztest_opts.zo_pool);
+	ASSERT(spa);
+	spa->spa_import_flags |= ZFS_IMPORT_SKIP_MMP;
+	mutex_exit(&spa_namespace_lock);
+
 	VERIFY0(spa_open(ztest_opts.zo_pool, &spa, FTAG));
 
 	ASSERT3U(RRSS_GET_OFFSET(&spa->spa_uberblock), !=, UINT64_MAX);
-	ASSERT3U(RRSS_GET_OFFSET(&spa->spa_uberblock), >=,
-	    RAIDZ_REFLOW_OFFSET_PAUSE);
-	ASSERT3U(RRSS_GET_STATE(&spa->spa_uberblock), ==, RRSS_SCRATCH_VALID);
 
-	ztest_scratch_state->zs_do_raidz_scratch_verify = B_FALSE;
+	pause = ztest_scratch_state->zs_raidz_scratch_verify_pause;
+	offset = RRSS_GET_OFFSET(&spa->spa_uberblock);
+	state = RRSS_GET_STATE(&spa->spa_uberblock);
+
+	if (pause < RAIDZ_EXPAND_PAUSE_SCRATCH_VALID) {
+		ASSERT3U(offset, ==, 0);
+		ASSERT3U(state, ==, RRSS_SCRATCH_NOT_IN_USE);
+	} else if (pause >= RAIDZ_EXPAND_PAUSE_SCRATCH_VALID &&
+	    pause <= RAIDZ_EXPAND_PAUSE_SCRATCH_REFLOWED) {
+		ASSERT3U(offset, >=, pause);
+		ASSERT3U(state, ==, RRSS_SCRATCH_VALID);
+	} else {
+		ASSERT(pause <= RAIDZ_EXPAND_PAUSE_SCRATCH_NOT_IN_USE);
+		ASSERT3U(offset, >, pause);
+		ASSERT3U(state, ==, RRSS_SCRATCH_NOT_IN_USE);
+	}
+
+	ztest_scratch_state->zs_raidz_scratch_verify_pause = 0;
 
 	spa_close(spa, FTAG);
 	kernel_fini();
@@ -3956,7 +3998,7 @@ static void
 ztest_scratch_thread(void *arg)
 {
 	for (int t = 100; t > 0; t -= 1) {
-		if (!ztest_scratch_state->zs_do_raidz_scratch_verify)
+		if (raidz_expand_max_offset_pause == 0)
 			thread_exit();
 
 		(void) poll(NULL, 0, 100);
@@ -4028,8 +4070,8 @@ ztest_vdev_raidz_attach(ztest_ds_t *zd, uint64_t id)
 	    0, 0, 1);
 
 	if (ztest_random(2) == 0 && expected_error == 0) {
-		raidz_expand_max_offset_pause = RAIDZ_REFLOW_OFFSET_PAUSE;
-		ztest_scratch_state->zs_do_raidz_scratch_verify = B_TRUE;
+		raidz_expand_max_offset_pause =
+		    ztest_random(RAIDZ_EXPAND_PAUSE_SCRATCH_NOT_IN_USE) + 1;
 		scratch_thread = thread_create(NULL, 0, ztest_scratch_thread,
 		    ztest_shared, 0, NULL, TS_RUN | TS_JOINABLE, defclsyspri);
 	}
@@ -4048,14 +4090,13 @@ ztest_vdev_raidz_attach(ztest_ds_t *zd, uint64_t id)
 		    newpath, newsize, error, expected_error);
 	}
 
-	if (ztest_scratch_state->zs_do_raidz_scratch_verify) {
+	if (raidz_expand_max_offset_pause) {
 		if (error != 0) {
 			/*
 			 * Do not verify scratch object in case of error
 			 * returned by vdev attaching.
 			 */
 			raidz_expand_max_offset_pause = 0;
-			ztest_scratch_state->zs_do_raidz_scratch_verify = B_FALSE;
 		}
 
 		VERIFY0(thread_join(scratch_thread));
@@ -7384,7 +7425,7 @@ ztest_thread(void *arg)
 		/*
 		 * See if it's time to force a crash.
 		 */
-		if (now > zs->zs_thread_kill)
+		if (now > zs->zs_thread_kill && !raidz_expand_max_offset_pause)
 			ztest_kill(zs);
 
 		/*
