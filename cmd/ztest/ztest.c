@@ -457,16 +457,16 @@ ztest_info_t ztest_info[] = {
 	ZTI_INIT(ztest_dmu_write_parallel, 10, &zopt_always, B_TRUE),
 	ZTI_INIT(ztest_dmu_object_alloc_free, 1, &zopt_always, B_TRUE),
 	ZTI_INIT(ztest_dmu_object_next_chunk, 1, &zopt_sometimes, B_TRUE),
-	ZTI_INIT(ztest_dmu_commit_callbacks, 1, &zopt_always, B_FALSE),
-	ZTI_INIT(ztest_zap, 30, &zopt_always, B_FALSE),
-	ZTI_INIT(ztest_zap_parallel, 100, &zopt_always, B_FALSE),
-	ZTI_INIT(ztest_split_pool, 1, &zopt_always, B_FALSE),
-	ZTI_INIT(ztest_zil_commit, 1, &zopt_incessant, B_FALSE),
-	ZTI_INIT(ztest_zil_remount, 1, &zopt_sometimes, B_FALSE),
-	ZTI_INIT(ztest_dmu_read_write_zcopy, 1, &zopt_often, B_FALSE),
-	ZTI_INIT(ztest_dmu_objset_create_destroy, 1, &zopt_often, B_FALSE),
-	ZTI_INIT(ztest_dsl_prop_get_set, 1, &zopt_often, B_FALSE),
-	ZTI_INIT(ztest_spa_prop_get_set, 1, &zopt_sometimes, B_FALSE),
+	ZTI_INIT(ztest_dmu_commit_callbacks, 1, &zopt_always, B_TRUE),
+	ZTI_INIT(ztest_zap, 30, &zopt_always, B_TRUE),
+	ZTI_INIT(ztest_zap_parallel, 100, &zopt_always, B_TRUE),
+	ZTI_INIT(ztest_split_pool, 1, &zopt_always, B_TRUE),
+	ZTI_INIT(ztest_zil_commit, 1, &zopt_incessant, B_TRUE),
+	ZTI_INIT(ztest_zil_remount, 1, &zopt_sometimes, B_TRUE),
+	ZTI_INIT(ztest_dmu_read_write_zcopy, 1, &zopt_often, B_TRUE),
+	ZTI_INIT(ztest_dmu_objset_create_destroy, 1, &zopt_often, B_TRUE),
+	ZTI_INIT(ztest_dsl_prop_get_set, 1, &zopt_often, B_TRUE),
+	ZTI_INIT(ztest_spa_prop_get_set, 1, &zopt_sometimes, B_TRUE),
 #if 0
 	ZTI_INIT(ztest_dmu_prealloc, 1, &zopt_sometimes, B_FALSE),
 #endif
@@ -6338,6 +6338,17 @@ ztest_fault_inject(ztest_ds_t *zd, uint64_t id)
 		goto out;
 	}
 
+	/*
+	 * The fault injection strategy for damaging blocks cannot be used
+	 * for expandable raidz. The leaves value (attached raidz children)
+	 * is variable and strategy for damaging blocks will corrupt same data
+	 * blocks on different child vdevs because of reflow process.
+	 */
+	if (ztest_opts.zo_raid_do_expand) {
+		mutex_exit(&ztest_vdev_lock);
+		goto out;
+	}
+
 	maxfaults = MAXFAULTS(zs);
 	raidz_children = ztest_get_raidz_children(spa);
 	leaves = MAX(zs->zs_mirrors, 1) * raidz_children;
@@ -7615,9 +7626,6 @@ ztest_freeze(void)
 	ztest_ds_t *zd = &ztest_ds[0];
 	spa_t *spa;
 	int numloops = 0;
-
-	if (ztest_opts.zo_raid_do_expand)
-		return;
 
 	if (ztest_opts.zo_verbose >= 3)
 		(void) printf("testing spa_freeze()...\n");
