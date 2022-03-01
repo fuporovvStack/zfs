@@ -149,6 +149,7 @@ typedef struct ztest_shared_hdr {
 	uint64_t	zh_stats_count;
 	uint64_t	zh_ds_size;
 	uint64_t	zh_ds_count;
+	uint64_t	zh_scratch_state_size;
 } ztest_shared_hdr_t;
 
 static ztest_shared_hdr_t *ztest_shared_hdr;
@@ -275,6 +276,12 @@ typedef struct ztest_shared_ds {
 
 static ztest_shared_ds_t *ztest_shared_ds;
 #define	ZTEST_GET_SHARED_DS(d) (&ztest_shared_ds[d])
+
+typedef struct ztest_scratch_state {
+	boolean_t	zs_do_raidz_scratch_verify;
+} ztest_shared_scratch_state_t;
+
+static ztest_shared_scratch_state_t *ztest_scratch_state;
 
 #define	BT_MAGIC	0x123456789abcdefULL
 #define	MAXFAULTS(zs) \
@@ -534,7 +541,6 @@ typedef struct ztest_cb_list {
  */
 typedef struct ztest_shared {
 	boolean_t	zs_do_init;
-	boolean_t	zs_do_raidz_scratch_verify;
 	hrtime_t	zs_proc_start;
 	hrtime_t	zs_proc_stop;
 	hrtime_t	zs_thread_start;
@@ -3929,7 +3935,7 @@ raidz_scratch_verify(void)
 {
 	spa_t *spa;
 
-	if (ztest_shared->zs_do_raidz_scratch_verify == B_FALSE)
+	if (ztest_scratch_state->zs_do_raidz_scratch_verify == B_FALSE)
 		return;
 
 	kernel_init(SPA_MODE_READ);
@@ -3940,7 +3946,7 @@ raidz_scratch_verify(void)
 	    RAIDZ_REFLOW_OFFSET_PAUSE);
 	ASSERT3U(RRSS_GET_STATE(&spa->spa_uberblock), ==, RRSS_SCRATCH_VALID);
 
-	ztest_shared->zs_do_raidz_scratch_verify = B_FALSE;
+	ztest_scratch_state->zs_do_raidz_scratch_verify = B_FALSE;
 
 	spa_close(spa, FTAG);
 	kernel_fini();
@@ -3949,9 +3955,8 @@ raidz_scratch_verify(void)
 static void
 ztest_scratch_thread(void *arg)
 {
-	ztest_shared_t *zs = arg;
 	for (int t = 100; t > 0; t -= 1) {
-		if (!zs->zs_do_raidz_scratch_verify)
+		if (!ztest_scratch_state->zs_do_raidz_scratch_verify)
 			thread_exit();
 
 		(void) poll(NULL, 0, 100);
@@ -4024,7 +4029,7 @@ ztest_vdev_raidz_attach(ztest_ds_t *zd, uint64_t id)
 
 	if (ztest_random(2) == 0 && expected_error == 0) {
 		raidz_expand_max_offset_pause = RAIDZ_REFLOW_OFFSET_PAUSE;
-		ztest_shared->zs_do_raidz_scratch_verify = B_TRUE;
+		ztest_scratch_state->zs_do_raidz_scratch_verify = B_TRUE;
 		scratch_thread = thread_create(NULL, 0, ztest_scratch_thread,
 		    ztest_shared, 0, NULL, TS_RUN | TS_JOINABLE, defclsyspri);
 	}
@@ -4043,14 +4048,14 @@ ztest_vdev_raidz_attach(ztest_ds_t *zd, uint64_t id)
 		    newpath, newsize, error, expected_error);
 	}
 
-	if (ztest_shared->zs_do_raidz_scratch_verify) {
+	if (ztest_scratch_state->zs_do_raidz_scratch_verify) {
 		if (error != 0) {
 			/*
 			 * Do not verify scratch object in case of error
 			 * returned by vdev attaching.
 			 */
 			raidz_expand_max_offset_pause = 0;
-			ztest_shared->zs_do_raidz_scratch_verify = B_FALSE;
+			ztest_scratch_state->zs_do_raidz_scratch_verify = B_FALSE;
 		}
 
 		VERIFY0(thread_join(scratch_thread));
@@ -8444,6 +8449,7 @@ shared_data_size(ztest_shared_hdr_t *hdr)
 	size += hdr->zh_size;
 	size += hdr->zh_stats_size * hdr->zh_stats_count;
 	size += hdr->zh_ds_size * hdr->zh_ds_count;
+	size += hdr->zh_scratch_state_size;
 
 	return (size);
 }
@@ -8467,6 +8473,7 @@ setup_hdr(void)
 	hdr->zh_stats_count = ZTEST_FUNCS;
 	hdr->zh_ds_size = sizeof (ztest_shared_ds_t);
 	hdr->zh_ds_count = ztest_opts.zo_datasets;
+	hdr->zh_scratch_state_size = sizeof (ztest_shared_scratch_state_t);
 
 	size = shared_data_size(hdr);
 	VERIFY0(ftruncate(ztest_fd_data, size));
@@ -8501,6 +8508,8 @@ setup_data(void)
 	ztest_shared_callstate = (void *)&buf[offset];
 	offset += hdr->zh_stats_size * hdr->zh_stats_count;
 	ztest_shared_ds = (void *)&buf[offset];
+	offset += hdr->zh_ds_size * hdr->zh_ds_count;
+	ztest_scratch_state = (void *)&buf[offset];
 }
 
 static boolean_t
