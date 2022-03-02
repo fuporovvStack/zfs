@@ -469,7 +469,7 @@ ztest_info_t ztest_info[] = {
 	ZTI_INIT(ztest_spa_create_destroy, 1, &zopt_sometimes, B_FALSE),
 	ZTI_INIT(ztest_fault_inject, 1, &zopt_sometimes, B_FALSE),
 	ZTI_INIT(ztest_dmu_snapshot_hold, 1, &zopt_sometimes, B_FALSE),
-	ZTI_INIT(ztest_mmp_enable_disable, 1, &zopt_sometimes, B_FALSE),
+	ZTI_INIT(ztest_mmp_enable_disable, 1, &zopt_sometimes, B_TRUE),
 	ZTI_INIT(ztest_reguid, 1, &zopt_rarely, B_FALSE),
 	ZTI_INIT(ztest_scrub, 1, &zopt_rarely, B_FALSE),
 	ZTI_INIT(ztest_spa_upgrade, 1, &zopt_rarely, B_FALSE),

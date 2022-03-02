@@ -677,7 +677,7 @@ mmp_thread(void *arg)
 			zio_suspend(spa, NULL, ZIO_SUSPEND_MMP);
 		}
 
-		if (multihost && !suspended)
+		if (spa->spa_raidz_expand == NULL && multihost && !suspended)
 			mmp_write_uberblock(spa);
 
 		if (skip_wait > 0) {
