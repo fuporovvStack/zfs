@@ -6329,6 +6329,7 @@ ztest_fault_inject(ztest_ds_t *zd, uint64_t id)
 	vdev_t *vd0 = NULL;
 	uint64_t guid0 = 0;
 	boolean_t islog = B_FALSE;
+	boolean_t injected = B_FALSE;
 
 	path0 = umem_alloc(MAXPATHLEN, UMEM_NOFAIL);
 	pathrand = umem_alloc(MAXPATHLEN, UMEM_NOFAIL);
@@ -6341,27 +6342,23 @@ ztest_fault_inject(ztest_ds_t *zd, uint64_t id)
 	 * strategy for damaging blocks does not take in to account evacuated
 	 * blocks which may have already been damaged.
 	 */
-	if (ztest_device_removal_active) {
-		mutex_exit(&ztest_vdev_lock);
+	if (ztest_device_removal_active)
 		goto out;
-	}
 
 	/*
 	 * The fault injection strategy for damaging blocks cannot be used
-	 * for expandable raidz. The leaves value (attached raidz children)
-	 * is variable and strategy for damaging blocks will corrupt same data
-	 * blocks on different child vdevs because of reflow process.
+	 * if raidz expansion is in progress. The leaves value
+	 * (attached raidz children) is variable and strategy for damaging
+	 * blocks will corrupt same data blocks on different child vdevs
+	 * because of reflow process.
 	 */
-	if (ztest_opts.zo_raid_do_expand) {
-		mutex_exit(&ztest_vdev_lock);
+	if (spa->spa_raidz_expand != NULL)
 		goto out;
-	}
 
 	maxfaults = MAXFAULTS(zs);
 	raidz_children = ztest_get_raidz_children(spa);
 	leaves = MAX(zs->zs_mirrors, 1) * raidz_children;
 	mirror_save = zs->zs_mirrors;
-	mutex_exit(&ztest_vdev_lock);
 
 	ASSERT3U(leaves, >=, 1);
 
@@ -6502,13 +6499,9 @@ ztest_fault_inject(ztest_ds_t *zd, uint64_t id)
 			 * call vdev_[on|off]line without holding locks
 			 * to force unpredictable failures but the side
 			 * effects of vdev_[on|off]line prevent us from
-			 * doing so. We grab the ztest_vdev_lock here to
-			 * prevent a race between injection testing and
-			 * aux_vdev removal.
+			 * doing so.
 			 */
-			mutex_enter(&ztest_vdev_lock);
 			(void) vdev_online(spa, guid0, 0, NULL);
-			mutex_exit(&ztest_vdev_lock);
 		}
 	}
 
@@ -6582,9 +6575,7 @@ ztest_fault_inject(ztest_ds_t *zd, uint64_t id)
 		    offset + sizeof (bad) > psize - VDEV_LABEL_END_SIZE)
 			continue;
 
-		mutex_enter(&ztest_vdev_lock);
 		if (mirror_save != zs->zs_mirrors) {
-			mutex_exit(&ztest_vdev_lock);
 			(void) close(fd);
 			goto out;
 		}
@@ -6594,15 +6585,25 @@ ztest_fault_inject(ztest_ds_t *zd, uint64_t id)
 			    "can't inject bad word at 0x%"PRIx64" in %s",
 			    offset, pathrand);
 
-		mutex_exit(&ztest_vdev_lock);
-
 		if (ztest_opts.zo_verbose >= 7)
 			(void) printf("injected bad word into %s,"
 			    " offset 0x%"PRIx64"\n", pathrand, offset);
+
+		injected = B_TRUE;
 	}
 
 	(void) close(fd);
 out:
+	mutex_exit(&ztest_vdev_lock);
+
+	if (injected && ztest_opts.zo_raid_do_expand) {
+		int error = spa_scan(spa, POOL_SCAN_SCRUB);
+		if (error == 0) {
+			while (dsl_scan_scrubbing(spa_get_dsl(spa)))
+				txg_wait_synced(spa_get_dsl(spa), 0);
+		}
+	}
+
 	umem_free(path0, MAXPATHLEN);
 	umem_free(pathrand, MAXPATHLEN);
 }
