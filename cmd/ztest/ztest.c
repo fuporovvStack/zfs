@@ -4014,8 +4014,9 @@ ztest_scratch_thread(void *arg)
 void
 ztest_vdev_raidz_attach(ztest_ds_t *zd, uint64_t id)
 {
+	ztest_shared_t *zs = ztest_shared;
 	spa_t *spa = ztest_spa;
-	uint64_t newsize, ashift = ztest_get_ashift();
+	uint64_t leaves, raidz_children, newsize, ashift = ztest_get_ashift();
 	kthread_t *scratch_thread = NULL;
 	vdev_t *newvd, *pvd;
 	nvlist_t *root;
@@ -4052,6 +4053,13 @@ ztest_vdev_raidz_attach(ztest_ds_t *zd, uint64_t id)
 	newvd = pvd->vdev_child[ztest_random(pvd->vdev_children)];
 	newsize = 10 * vdev_get_min_asize(newvd) / (9 + ztest_random(2));
 
+	/*
+	 * Get next attached leaf id
+	 */
+	raidz_children = ztest_get_raidz_children(spa);
+	leaves = MAX(zs->zs_mirrors + zs->zs_splits, 1) * raidz_children;
+	zs->zs_vdev_next_leaf = spa_num_top_vdevs(spa) * leaves;
+
 	if (spa->spa_raidz_expand)
 		expected_error = ZFS_ERR_RAIDZ_EXPAND_IN_PROGRESS;
 
@@ -4061,7 +4069,7 @@ ztest_vdev_raidz_attach(ztest_ds_t *zd, uint64_t id)
 	 * Path to vdev to be attached
 	 */
 	(void) snprintf(newpath, MAXPATHLEN, ztest_dev_template,
-	    ztest_opts.zo_dir, ztest_opts.zo_pool, pvd->vdev_children);
+	    ztest_opts.zo_dir, ztest_opts.zo_pool, zs->zs_vdev_next_leaf);
 
 	/*
 	 * Build the nvlist describing newpath.
