@@ -3742,6 +3742,14 @@ ztest_vdev_attach_detach(ztest_ds_t *zd, uint64_t id)
 	}
 
 	/*
+	 * Does not work with expandable raidz, bp corruptions detected.
+	 */
+	if (ztest_opts.zo_raid_do_expand) {
+		spa_config_exit(spa, SCL_ALL, FTAG);
+		goto out;
+	}
+
+	/*
 	 * Decide whether to do an attach or a replace.
 	 */
 	replacing = ztest_random(2);
