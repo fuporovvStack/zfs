@@ -63,6 +63,22 @@ struct consumer_vdev_elem {
 	vdev_t	*vd;
 };
 
+/* Disk device access types */
+typedef enum access_type {
+	ACCESS_GEOM,
+	ACCESS_RAW
+} access_type_t;
+
+/*
+ * This structure uses for adding additional indirection layer to provide
+ * ability to switch access mode for devices with and w/o geom provider.
+ */
+struct vdev_data
+{
+	access_type_t	type;
+	void		*data;
+};
+
 SLIST_HEAD(consumer_priv_t, consumer_vdev_elem);
 _Static_assert(
     sizeof (((struct g_consumer *)NULL)->private) ==
@@ -213,6 +229,7 @@ vdev_geom_attach(struct g_provider *pp, vdev_t *vd, boolean_t sanity)
 {
 	struct g_geom *gp;
 	struct g_consumer *cp;
+	struct vdev_data *vdp;
 	int error;
 
 	g_topology_assert();
@@ -298,8 +315,12 @@ vdev_geom_attach(struct g_provider *pp, vdev_t *vd, boolean_t sanity)
 		}
 	}
 
-	if (vd != NULL)
-		vd->vdev_tsd = cp;
+	if (vd != NULL) {
+		vdp = malloc(sizeof (struct vdev_data), M_TEMP, M_WAITOK);
+		vdp->type = ACCESS_GEOM;
+		vdp->data = cp;
+		vd->vdev_tsd = vdp;
+	}
 
 	cp->flags |= G_CF_DIRECT_SEND | G_CF_DIRECT_RECEIVE;
 	return (cp);
@@ -342,17 +363,22 @@ vdev_geom_close_locked(vdev_t *vd)
 	struct g_consumer *cp;
 	struct consumer_priv_t *priv;
 	struct consumer_vdev_elem *elem, *elem_temp;
+	struct vdev_data *vdp;
 
 	g_topology_assert();
 
-	cp = vd->vdev_tsd;
+	vdp = vd->vdev_tsd;
 	vd->vdev_delayed_close = B_FALSE;
-	if (cp == NULL)
+	if (vdp == NULL)
 		return;
+
+	ASSERT(vdp->type == ACCESS_GEOM);
+	cp = vdp->data;
 
 	ZFS_LOG(1, "Closing access to %s.", cp->provider->name);
 	KASSERT(cp->private != NULL, ("%s: cp->private is NULL", __func__));
 	priv = (struct consumer_priv_t *)&cp->private;
+	kmem_free(vdp, sizeof (struct vdev_data));
 	vd->vdev_tsd = NULL;
 	SLIST_FOREACH_SAFE(elem, priv, elems, elem_temp) {
 		if (elem->vd == vd) {
@@ -802,11 +828,161 @@ vdev_geom_open_by_path(vdev_t *vd, int check_guid)
 }
 
 static int
+vdev_raw_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
+    uint64_t *logical_ashift, uint64_t *physical_ashift)
+{
+	struct diocgattr_arg arg;
+	struct vdev_data *vdp;
+	struct thread *td;
+	struct vnode *vp;
+	struct file *fp;
+	struct nameidata nd;
+	char path[MAXPATHLEN] = {0};
+	mode_t mode;
+	int flags, error;
+	u_int sectorsize;
+	off_t stripesize = 0;
+	off_t stripeoffset = 0;
+	off_t mediasize;
+
+	flags = O_RDWR;
+	td = curthread;
+	pwd_ensure_dirs();
+
+	if ((spa_mode(vd->vdev_spa) & SPA_MODE_READ) &&
+	    (spa_mode(vd->vdev_spa) & SPA_MODE_WRITE)) {
+		mode = O_RDWR;
+	} else if (spa_mode(vd->vdev_spa) & SPA_MODE_READ) {
+		mode = O_RDONLY;
+	} else if (spa_mode(vd->vdev_spa) & SPA_MODE_WRITE) {
+		mode = O_WRONLY;
+	}
+
+	KASSERT((flags & (O_EXEC | O_PATH)) == 0,
+	    ("invalid flags: 0x%x", flags));
+	KASSERT((flags & O_ACCMODE) != O_ACCMODE,
+	    ("invalid flags: 0x%x", flags));
+	flags = FFLAGS(flags);
+
+	/*
+	 * Reopen the device if it's not currently open. Otherwise,
+	 * just update the physical size of the device.
+	 */
+	if ((vdp = vd->vdev_tsd) != NULL) {
+		ASSERT(vd->vdev_reopening);
+		ASSERT(vdp->type == ACCESS_RAW);
+		fp = vdp->data;
+		goto skip_open;
+	}
+
+	error = falloc_noinstall(td, &fp);
+	if (error != 0) {
+		vdev_dbgmsg(vd, "vdev_raw_open: falloc failed: [error=%d]",
+		    error);
+		return (error);
+	}
+
+	fp->f_flag = flags & FMASK;
+
+	memcpy(path, vd->vdev_path, MAXPATHLEN);
+#if __FreeBSD_version >= 1400043
+	NDINIT(&nd, LOOKUP, FOLLOW, UIO_SYSSPACE, path);
+#else
+	NDINIT(&nd, LOOKUP, FOLLOW, UIO_SYSSPACE, path, td);
+#endif
+	error = vn_open(&nd, &flags, mode, fp);
+	if (error != 0) {
+		vdev_dbgmsg(vd, "vdev_raw_open: open failed: [error=%d]",
+		    error);
+		falloc_abort(td, fp);
+		return (SET_ERROR(error));
+	}
+	NDFREE_PNBUF(&nd);
+	vp = nd.ni_vp;
+	fp->f_vnode = vp;
+	if (fp->f_ops == &badfileops) {
+		finit_vnode(fp, flags, NULL, &vnops);
+	}
+	vref(vp);
+	VOP_UNLOCK(vp);
+	if (!IS_DEVVP(vp)) {
+		vdev_dbgmsg(vd, "vdev_raw_open: vdev is not dev");
+		vrele(fp->f_vnode);
+		fdrop(fp, curthread);
+		return (SET_ERROR(EACCES));
+	}
+
+	vdp = malloc(sizeof (struct vdev_data), M_TEMP, M_WAITOK);
+	vdp->type = ACCESS_RAW;
+	vdp->data = fp;
+	vd->vdev_tsd = vdp;
+
+skip_open:
+	error = fo_ioctl(fp, DIOCGMEDIASIZE, (caddr_t)&mediasize,
+	    td->td_ucred, td);
+	if (error) {
+		vdev_dbgmsg(vd, "vdev_raw_open: cannot get media size");
+		vrele(fp->f_vnode);
+		fdrop(fp, curthread);
+		return (SET_ERROR(EINVAL));
+	}
+
+	error = fo_ioctl(fp, DIOCGSECTORSIZE, (caddr_t)&sectorsize,
+	    td->td_ucred, td);
+	if (error) {
+		vdev_dbgmsg(vd, "vdev_raw_open: cannot get sector size");
+		vrele(fp->f_vnode);
+		fdrop(fp, curthread);
+		return (SET_ERROR(EINVAL));
+	}
+
+	*max_psize = *psize = mediasize;
+
+	error = fo_ioctl(fp, DIOCGSTRIPESIZE, (caddr_t)&stripesize,
+	    td->td_ucred, td);
+	if (error)
+		vdev_dbgmsg(vd, "vdev_raw_open: cannot get stripe size");
+
+	error = fo_ioctl(fp, DIOCGSTRIPEOFFSET, (caddr_t)&stripeoffset,
+	    td->td_ucred, td);
+	if (error)
+		vdev_dbgmsg(vd, "vdev_raw_open: cannot get stripe offset");
+
+	*logical_ashift = highbit(MAX(sectorsize, SPA_MINBLOCKSIZE)) - 1;
+	*physical_ashift = 0;
+	if (stripesize && stripesize > (1 << *logical_ashift) &&
+	    ISP2(stripesize) && stripeoffset == 0)
+		*physical_ashift = highbit(stripesize) - 1;
+
+	vd->vdev_nowritecache = B_FALSE;
+
+	vd->vdev_nonrot = B_FALSE;
+	strlcpy(arg.name, "GEOM::rotation_rate", sizeof (arg.name));
+	arg.len = sizeof (arg.value.u16);
+	error = fo_ioctl(fp, DIOCGATTR, (caddr_t)&arg, td->td_ucred, td);
+	if (error == 0 && arg.value.u16 == DISK_RR_NON_ROTATING)
+		vd->vdev_nonrot = B_TRUE;
+
+	vd->vdev_has_trim = B_FALSE;
+	strlcpy(arg.name, "GEOM::candelete", sizeof (arg.name));
+	arg.len = sizeof (arg.value.i);
+	error = fo_ioctl(fp, DIOCGATTR, (caddr_t)&arg, td->td_ucred, td);
+	if (error == 0)
+		vd->vdev_has_trim = (arg.value.i != 0);
+
+	/* unavailable on FreeBSD */
+	vd->vdev_has_securetrim = B_FALSE;
+
+	return (0);
+}
+
+static int
 vdev_geom_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
     uint64_t *logical_ashift, uint64_t *physical_ashift)
 {
 	struct g_provider *pp;
 	struct g_consumer *cp;
+	struct vdev_data *vdp;
 	int error, has_trim;
 	uint16_t rate;
 
@@ -828,8 +1004,14 @@ vdev_geom_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 	 * Reopen the device if it's not currently open. Otherwise,
 	 * just update the physical size of the device.
 	 */
-	if ((cp = vd->vdev_tsd) != NULL) {
+	if ((vdp = vd->vdev_tsd) != NULL) {
 		ASSERT(vd->vdev_reopening);
+		if (vdp->type == ACCESS_RAW) {
+			return (vdev_raw_open(vd, psize, max_psize,
+			    logical_ashift, physical_ashift));
+		}
+
+		cp = vdp->data;
 		goto skip_open;
 	}
 
@@ -877,8 +1059,9 @@ vdev_geom_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 	VERIFY0(tsd_set(zfs_geom_probe_vdev_key, NULL));
 
 	if (cp == NULL) {
-		ZFS_LOG(1, "Vdev %s not found.", vd->vdev_path);
-		error = ENOENT;
+		ZFS_LOG(1, "Vdev geom %s not found.", vd->vdev_path);
+		error = vdev_raw_open(vd, psize, max_psize,
+		    logical_ashift, physical_ashift);
 	} else {
 		struct consumer_priv_t *priv;
 		struct consumer_vdev_elem *elem;
@@ -933,8 +1116,10 @@ vdev_geom_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 	PICKUP_GIANT();
 	if (cp == NULL) {
 		vd->vdev_stat.vs_aux = VDEV_AUX_OPEN_FAILED;
-		vdev_dbgmsg(vd, "vdev_geom_open: failed to open [error=%d]",
-		    error);
+		if (error)
+			vdev_dbgmsg(vd, "vdev_geom_open: failed: [error=%d]",
+			    error);
+
 		return (error);
 	}
 skip_open:
@@ -982,8 +1167,26 @@ skip_open:
 static void
 vdev_geom_close(vdev_t *vd)
 {
+	struct vdev_data *vdp;
 	struct g_consumer *cp;
+	struct file *fp;
 	boolean_t locked;
+
+	vdp = vd->vdev_tsd;
+	if (vdp == NULL) {
+		vd->vdev_delayed_close = B_FALSE;
+		return;
+	}
+
+	if (vdp->type == ACCESS_RAW) {
+		fp = vdp->data;
+		vrele(fp->f_vnode);
+		fdrop(fp, curthread);
+		vd->vdev_delayed_close = B_FALSE;
+		kmem_free(vdp, sizeof (struct vdev_data));
+		vd->vdev_tsd = NULL;
+		return;
+	}
 
 	cp = vd->vdev_tsd;
 
@@ -1091,7 +1294,7 @@ vdev_geom_check_unmapped(zio_t *zio, struct g_consumer *cp)
 	 * If unmapped I/O is not supported by the GEOM provider,
 	 * then we can't do anything and have to copy the data.
 	 */
-	if ((cp->provider->flags & G_PF_ACCEPT_UNMAPPED) == 0)
+	if (cp && ((cp->provider->flags & G_PF_ACCEPT_UNMAPPED) == 0))
 		return (0);
 
 	/* Check the buffer chunks sizes/alignments and count pages. */
@@ -1130,8 +1333,13 @@ static void
 vdev_geom_io_start(zio_t *zio)
 {
 	vdev_t *vd;
-	struct g_consumer *cp;
+	struct vdev_data *vdp;
+	struct g_consumer *cp = NULL;
+	struct file *fp = NULL;
 	struct bio *bp;
+	struct cdevsw *csw;
+	struct cdev *dev;
+	int ref;
 
 	vd = zio->io_vd;
 
@@ -1165,12 +1373,19 @@ vdev_geom_io_start(zio_t *zio)
 	    zio->io_type == ZIO_TYPE_TRIM ||
 	    zio->io_type == ZIO_TYPE_FLUSH);
 
-	cp = vd->vdev_tsd;
-	if (cp == NULL) {
+	vdp = vd->vdev_tsd;
+	if (vdp == NULL) {
 		zio->io_error = SET_ERROR(ENXIO);
 		zio_interrupt(zio);
 		return;
 	}
+
+	if (vdp->type == ACCESS_RAW) {
+		fp = vdp->data;
+	} else {
+		cp = vdp->data;
+	}
+
 	bp = g_alloc_bio();
 	bp->bio_caller1 = zio;
 	switch (zio->io_type) {
@@ -1178,7 +1393,7 @@ vdev_geom_io_start(zio_t *zio)
 	case ZIO_TYPE_WRITE:
 		zio->io_target_timestamp = zio_handle_io_delay(zio);
 		bp->bio_offset = zio->io_offset;
-		bp->bio_length = zio->io_size;
+		bp->bio_bcount = bp->bio_length = zio->io_size;
 		if (zio->io_type == ZIO_TYPE_READ)
 			bp->bio_cmd = BIO_READ;
 		else
@@ -1218,7 +1433,7 @@ vdev_geom_io_start(zio_t *zio)
 	case ZIO_TYPE_FLUSH:
 		bp->bio_cmd = BIO_FLUSH;
 		bp->bio_data = NULL;
-		bp->bio_offset = cp->provider->mediasize;
+		bp->bio_offset = cp ? cp->provider->mediasize : vd->vdev_asize;
 		bp->bio_length = 0;
 		break;
 	default:
@@ -1227,7 +1442,19 @@ vdev_geom_io_start(zio_t *zio)
 	bp->bio_done = vdev_geom_io_intr;
 	zio->io_bio = bp;
 
-	g_io_request(bp, cp);
+	if (fp) {
+		csw = devvn_refthread(fp->f_vnode, &dev, &ref);
+		if (csw == NULL) {
+			zio->io_error = SET_ERROR(ENXIO);
+			zio_interrupt(zio);
+			return;
+		}
+		bp->bio_dev = dev;
+		csw->d_strategy(bp);
+		dev_relthread(dev, ref);
+	} else {
+		g_io_request(bp, cp);
+	}
 }
 
 static void

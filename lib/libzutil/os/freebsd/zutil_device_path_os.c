@@ -79,13 +79,24 @@ zfs_get_underlying_path(const char *dev_name)
 boolean_t
 zfs_dev_is_whole_disk(const char *dev_name)
 {
-	int fd;
+	struct stat64 statbuf;
+	int fd, err;
 
 	fd = g_open(dev_name, 0);
 	if (fd >= 0) {
 		g_close(fd);
 		return (B_TRUE);
 	}
+
+	err = stat64(dev_name, &statbuf);
+	if (err) {
+		return (B_FALSE);
+	}
+
+	if (S_ISCHR(statbuf.st_mode) || S_ISBLK(statbuf.st_mode)) {
+		return (B_TRUE);
+	}
+
 	return (B_FALSE);
 }
 
