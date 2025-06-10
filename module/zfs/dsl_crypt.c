@@ -866,7 +866,16 @@ spa_keystore_load_wkey(const char *dsname, dsl_crypto_params_t *dcp,
 	dsl_pool_rele(dp, FTAG);
 
 	/* create any zvols under this ds */
-	zvol_create_minors_recursive(dsname);
+	ret = zvol_create_minors_recursive(dsname);
+	if (ret != 0) {
+		/*
+		 * Ignore zvol creation error, if wkey was loaded successfully.
+		 * Just send the message about failure.
+		 */
+		zfs_dbgmsg("ZVOL dataset %s creation error (%d)", dsname, ret);
+		/* XXX: EINVAL IS IGNORED, is it possbile to ignore EINVAL only ? */
+		printf("==== spa_keystore_load_wkey(), ds=%s, err=%d\n", dsname, ret);
+	}
 
 	return (0);
 

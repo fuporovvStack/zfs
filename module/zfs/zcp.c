@@ -1165,9 +1165,9 @@ zcp_eval(const char *poolname, const char *program, boolean_t sync,
 	} else {
 		zcp_eval_open(&runinfo, poolname);
 	}
-	lua_close(state);
+	//lua_close(state);
 
-	crfree(cr);
+	//crfree(cr);
 
 	/*
 	 * Create device minor nodes for any new zvols.
@@ -1175,8 +1175,17 @@ zcp_eval(const char *poolname, const char *program, boolean_t sync,
 	for (nvpair_t *pair = nvlist_next_nvpair(runinfo.zri_new_zvols, NULL);
 	    pair != NULL;
 	    pair = nvlist_next_nvpair(runinfo.zri_new_zvols, pair)) {
-		zvol_create_minor(nvpair_name(pair));
+		err = zvol_create_minor(nvpair_name(pair));
+		if (err != 0) {
+			printf("==== zcp_eval():ERROR, name=%s, err=%d\n", nvpair_name(pair), err);
+			zcp_pool_error(&runinfo, poolname, err);
+			break;
+		} else {
+			printf("==== zcp_eval():OK, name=%s\n", nvpair_name(pair));
+		}
 	}
+	lua_close(state); // XXX: Moved 0
+	crfree(cr);        // XXX: Moved 1
 	fnvlist_free(runinfo.zri_new_zvols);
 
 	return (runinfo.zri_result);

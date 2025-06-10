@@ -5913,12 +5913,16 @@ spa_open_common(const char *pool, spa_t **spapp, const void *tag,
 		mutex_exit(&spa_namespace_lock);
 	}
 
-	if (firstopen)
-		zvol_create_minors_recursive(spa_name(spa));
+	if (firstopen) {
+		error = zvol_create_minors_recursive(spa_name(spa));
+		if (error)
+			printf("==== spa_open_common():P0, error=%d\n", error);
+	}
 
-	*spapp = spa;
+	if (error == 0)
+		*spapp = spa;
 
-	return (0);
+	return (error);
 }
 
 int
@@ -6892,8 +6896,11 @@ spa_import(char *pool, nvlist_t *config, nvlist_t *props, uint64_t flags)
 
 	mutex_exit(&spa_namespace_lock);
 
-	zvol_create_minors_recursive(pool);
-
+	error = zvol_create_minors_recursive(pool);
+	if (error) {
+		printf("==== spa_import():P0, error=%d\n", error);
+		return (error);
+	}
 	spa_import_os(spa);
 
 	return (0);

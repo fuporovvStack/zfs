@@ -114,6 +114,7 @@ typedef struct {
 	char name1[MAXNAMELEN];
 	char name2[MAXNAMELEN];
 	uint64_t value;
+	int error;
 } zvol_task_t;
 
 zv_request_task_t *
@@ -1451,14 +1452,15 @@ zvol_create_minors_cb(const char *dsname, void *arg)
  * 'visible' (which also verifies that the parent is a zvol), and if so,
  * a minor node for that snapshot is created.
  */
-void
+int
 zvol_create_minors_recursive(const char *name)
 {
 	list_t minors_list;
 	minors_job_t *job;
+	int error = 0;
 
 	if (zvol_inhibit_dev)
-		return;
+		return (0);
 
 	/*
 	 * This is the list for prefetch jobs. Whenever we found a match
@@ -1476,11 +1478,19 @@ zvol_create_minors_recursive(const char *name)
 	if (strchr(name, '@') != NULL) {
 		uint64_t snapdev;
 
-		int error = dsl_prop_get_integer(name, "snapdev",
+		error = dsl_prop_get_integer(name, "snapdev",
 		    &snapdev, NULL);
 
-		if (error == 0 && snapdev == ZFS_SNAPDEV_VISIBLE)
-			(void) zvol_os_create_minor(name);
+		if (error == 0 && snapdev == ZFS_SNAPDEV_VISIBLE) {
+			error = zvol_os_create_minor(name);
+			if (error) {
+				printf("==== zvol_create_minors_recursive():P0, error=%d\n", error);
+				goto out;
+			}
+		} else if (error == ENOENT) {
+			/* ignore ENOENT if "snapdev" property does not exist */
+			error = 0;
+		}
 	} else {
 		fstrans_cookie_t cookie = spl_fstrans_mark();
 		(void) dmu_objset_find(name, zvol_create_minors_cb,
@@ -1495,18 +1505,38 @@ zvol_create_minors_recursive(const char *name)
 	 * sequentially.
 	 */
 	while ((job = list_remove_head(&minors_list)) != NULL) {
-		if (!job->error)
-			(void) zvol_os_create_minor(job->name);
+		/* XXX: Comment do not create minors in case of error, buf free() the job*/
+		if (error == 0 && !job->error) {
+			error = zvol_os_create_minor(job->name);
+		}
 		kmem_strfree(job->name);
 		kmem_free(job, sizeof (minors_job_t));
+		if (error) {
+			printf("==== zvol_create_minors_recursive():P1, error=%d\n", error);
+		}
 	}
 
+out:
 	list_destroy(&minors_list);
+	return (error);
 }
 
-void
+int
 zvol_create_minor(const char *name)
 {
+	int error;
+
+	error = zvol_create_minors_recursive(name);
+	if (error) {
+		printf("==== zvol_create_minor():P0, error=%d\n", error);
+	}
+
+	return (error);
+
+	/* XXX Refactoring is required */
+#if 0
+	int error;
+
 	/*
 	 * Note: the dsl_pool_config_lock must not be held.
 	 * Minor node creation needs to obtain the zvol_state_lock.
@@ -1517,19 +1547,25 @@ zvol_create_minor(const char *name)
 	 */
 
 	if (zvol_inhibit_dev)
-		return;
+		return (0);
 
 	if (strchr(name, '@') != NULL) {
 		uint64_t snapdev;
 
-		int error = dsl_prop_get_integer(name,
+		error = dsl_prop_get_integer(name,
 		    "snapdev", &snapdev, NULL);
 
-		if (error == 0 && snapdev == ZFS_SNAPDEV_VISIBLE)
-			(void) zvol_os_create_minor(name);
+		if (error)
+			return (error);
+
+		if (snapdev == ZFS_SNAPDEV_VISIBLE)
+			error = zvol_os_create_minor(name);
 	} else {
-		(void) zvol_os_create_minor(name);
+		error = zvol_os_create_minor(name);
 	}
+
+	return (error);
+#endif
 }
 
 /*
@@ -1757,44 +1793,56 @@ static int
 zvol_set_snapdev_cb(const char *dsname, void *param)
 {
 	zvol_snapdev_cb_arg_t *arg = param;
+	int error = 0;
 
 	if (strchr(dsname, '@') == NULL)
 		return (0);
 
 	switch (arg->snapdev) {
 		case ZFS_SNAPDEV_VISIBLE:
-			(void) zvol_os_create_minor(dsname);
+			error = zvol_os_create_minor(dsname);
 			break;
 		case ZFS_SNAPDEV_HIDDEN:
 			(void) zvol_remove_minor_impl(dsname);
 			break;
 	}
 
-	return (0);
+	if (error)
+		printf("==== zvol_set_snapdev_cb():P0, error=%d\n", error);
+
+	return (error);
 }
 
-static void
+static int
 zvol_set_snapdev_impl(char *name, uint64_t snapdev)
 {
 	zvol_snapdev_cb_arg_t arg = {snapdev};
 	fstrans_cookie_t cookie = spl_fstrans_mark();
+	int error;
+
 	/*
 	 * The zvol_set_snapdev_sync() sets snapdev appropriately
 	 * in the dataset hierarchy. Here, we only scan snapshots.
 	 */
-	dmu_objset_find(name, zvol_set_snapdev_cb, &arg, DS_FIND_SNAPSHOTS);
+	error = dmu_objset_find(name, zvol_set_snapdev_cb, &arg, DS_FIND_SNAPSHOTS);
 	spl_fstrans_unmark(cookie);
+
+	if (error)
+		printf("==== zvol_set_snapdev_impl():P0, error=%d\n", error);
+
+	return (error);
 }
 
-static void
+static int
 zvol_set_volmode_impl(char *name, uint64_t volmode)
 {
 	fstrans_cookie_t cookie;
 	uint64_t old_volmode;
 	zvol_state_t *zv;
+	int error = 0;
 
 	if (strchr(name, '@') != NULL)
-		return;
+		return (0);
 
 	/*
 	 * It's unfortunate we need to remove minors before we create new ones:
@@ -1804,12 +1852,12 @@ zvol_set_volmode_impl(char *name, uint64_t volmode)
 	 */
 	zv = zvol_find_by_name(name, RW_NONE);
 	if (zv == NULL && volmode == ZFS_VOLMODE_NONE)
-			return;
+		return (0);
 	if (zv != NULL) {
 		old_volmode = zv->zv_volmode;
 		mutex_exit(&zv->zv_state_lock);
 		if (old_volmode == volmode)
-			return;
+			return (0);
 		zvol_wait_close(zv);
 	}
 	cookie = spl_fstrans_mark();
@@ -1820,17 +1868,22 @@ zvol_set_volmode_impl(char *name, uint64_t volmode)
 		case ZFS_VOLMODE_GEOM:
 		case ZFS_VOLMODE_DEV:
 			(void) zvol_remove_minor_impl(name);
-			(void) zvol_os_create_minor(name);
+			error = zvol_os_create_minor(name);
 			break;
 		case ZFS_VOLMODE_DEFAULT:
 			(void) zvol_remove_minor_impl(name);
 			if (zvol_volmode == ZFS_VOLMODE_NONE)
 				break;
 			else /* if zvol_volmode is invalid defaults to "geom" */
-				(void) zvol_os_create_minor(name);
+				error = zvol_os_create_minor(name);
 			break;
 	}
+
+	if (error)
+		printf("==== zvol_set_volmode_impl():P0, error=%d\n", error);
+
 	spl_fstrans_unmark(cookie);
+	return (error);
 }
 
 static zvol_task_t *
@@ -1876,17 +1929,18 @@ zvol_task_cb(void *arg)
 		zvol_rename_minors_impl(task->name1, task->name2);
 		break;
 	case ZVOL_ASYNC_SET_SNAPDEV:
-		zvol_set_snapdev_impl(task->name1, task->value);
+		task->error = zvol_set_snapdev_impl(task->name1, task->value);
 		break;
 	case ZVOL_ASYNC_SET_VOLMODE:
-		zvol_set_volmode_impl(task->name1, task->value);
+		task->error = zvol_set_volmode_impl(task->name1, task->value);
 		break;
 	default:
 		VERIFY(0);
 		break;
 	}
 
-	zvol_task_free(task);
+	if (task->error)
+		printf("==== zvol_task_cb():P0, error=%d\n", task->error);
 }
 
 typedef struct zvol_set_prop_int_arg {
@@ -1920,10 +1974,12 @@ zvol_set_common_check(void *arg, dmu_tx_t *tx)
 static int
 zvol_set_common_sync_cb(dsl_pool_t *dp, dsl_dataset_t *ds, void *arg)
 {
+	taskq_t *spa_zvol_taskq = dp->dp_spa->spa_zvol_taskq;
 	zvol_set_prop_int_arg_t *zsda = arg;
 	char dsname[ZFS_MAX_DATASET_NAME_LEN];
 	zvol_task_t *task;
 	uint64_t prop;
+	int error;
 
 	const char *prop_name = zfs_prop_to_name(zsda->zsda_prop);
 	dsl_dataset_name(ds, dsname);
@@ -1948,9 +2004,15 @@ zvol_set_common_sync_cb(dsl_pool_t *dp, dsl_dataset_t *ds, void *arg)
 	if (task == NULL)
 		return (0);
 
-	(void) taskq_dispatch(dp->dp_spa->spa_zvol_taskq, zvol_task_cb,
-	    task, TQ_SLEEP);
-	return (0);
+	(void) taskq_dispatch(spa_zvol_taskq, zvol_task_cb, task, TQ_SLEEP);
+	taskq_wait(spa_zvol_taskq);
+	error = task->error;
+	zvol_task_free(task);
+
+	if (error)
+		printf("==== zvol_set_common_sync_cb():P0, error=%d\n", error);
+
+	return (error);
 }
 
 /*

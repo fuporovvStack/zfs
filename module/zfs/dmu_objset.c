@@ -1374,12 +1374,17 @@ dmu_objset_create(const char *name, dmu_objset_type_t type, uint64_t flags,
 	int rv = dsl_sync_task(name,
 	    dmu_objset_create_check, dmu_objset_create_sync, &doca,
 	    6, ZFS_SPACE_CHECK_NORMAL);
+	if (rv) {
+		printf("==== dmu_objset_create():P0,rv=%d\n", rv);
+		goto out;
+	}
 
-	if (rv == 0)
-		zvol_create_minor(name);
+	rv = zvol_create_minor(name);
+	if (rv)
+		printf("==== dmu_objset_create():P1,rv=%d\n", rv);
 
+out:
 	crfree(cr);
-
 	return (rv);
 }
 

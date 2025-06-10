@@ -1372,6 +1372,8 @@ zvol_os_create_minor(const char *name)
 	int error;
 	bool replayed_zil = B_FALSE;
 
+	printf("==== zvol_os_create_minor(+):name=%s\n", name);
+
 	if (zvol_inhibit_dev)
 		return (0);
 
@@ -1389,16 +1391,22 @@ zvol_os_create_minor(const char *name)
 
 	/* Lie and say we're read-only. */
 	error = dmu_objset_own(name, DMU_OST_ZVOL, B_TRUE, B_TRUE, FTAG, &os);
-	if (error)
+	if (error) {
+		printf("==== zvol_os_create_minor():P0:err=%d\n", error);
 		goto out_doi;
+	}
 
 	error = dmu_object_info(os, ZVOL_OBJ, doi);
-	if (error)
+	if (error) {
+		printf("==== zvol_os_create_minor():P1:err=%d\n", error);
 		goto out_dmu_objset_disown;
+	}
 
 	error = zap_lookup(os, ZVOL_ZAP_OBJ, "size", 8, 1, &volsize);
-	if (error)
+	if (error) {
+		printf("==== zvol_os_create_minor():P2:err=%d\n", error);
 		goto out_dmu_objset_disown;
+	}
 
 	error = dsl_prop_get_integer(name,
 	    zfs_prop_to_name(ZFS_PROP_VOLMODE), &volmode, NULL);
@@ -1465,8 +1473,10 @@ zvol_os_create_minor(const char *name)
 
 	ASSERT3P(zv->zv_kstat.dk_kstats, ==, NULL);
 	error = dataset_kstats_create(&zv->zv_kstat, zv->zv_objset);
-	if (error)
+	if (error) {
+		printf("==== zvol_os_create_minor():P3:err=%d\n", error);
 		goto out_dmu_objset_disown;
+	}
 	ASSERT3P(zv->zv_zilog, ==, NULL);
 	zv->zv_zilog = zil_open(os, zvol_get_data, &zv->zv_kstat.dk_zil_sums);
 	if (spa_writeable(dmu_objset_spa(os))) {

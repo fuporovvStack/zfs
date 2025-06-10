@@ -1036,16 +1036,18 @@ kmem_cache_reap_active(void)
 	return (0);
 }
 
-void
+int
 zvol_create_minor(const char *name)
 {
 	(void) name;
+	return (0);
 }
 
-void
+int
 zvol_create_minors_recursive(const char *name)
 {
 	(void) name;
+	return (0);
 }
 
 void

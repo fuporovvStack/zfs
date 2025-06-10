@@ -2002,10 +2002,17 @@ dsl_dataset_snapshot(nvlist_t *snaps, nvlist_t *props, nvlist_t *errors)
 		fnvlist_free(suspended);
 	}
 
-	if (error == 0) {
-		for (pair = nvlist_next_nvpair(snaps, NULL); pair != NULL;
-		    pair = nvlist_next_nvpair(snaps, pair)) {
-			zvol_create_minor(nvpair_name(pair));
+	if (error) {
+		printf("==== dsl_dataset_snapshot():P0, error=%d\n", error);
+		return (error);
+	}
+
+	for (pair = nvlist_next_nvpair(snaps, NULL); pair != NULL;
+		pair = nvlist_next_nvpair(snaps, pair)) {
+		error = zvol_create_minor(nvpair_name(pair));
+		if (error) {
+			printf("==== dsl_dataset_snapshot(), error=%d\n", error);
+			break;
 		}
 	}
 

@@ -3827,16 +3827,29 @@ dmu_recv_end(dmu_recv_cookie_t *drc, void *owner)
 		error = dmu_recv_existing_end(drc);
 
 	if (error != 0) {
-		dmu_recv_cleanup_ds(drc);
-		nvlist_free(drc->drc_keynvl);
-	} else if (!drc->drc_heal) {
+		printf("==== dmu_recv_end():P0,error=%d\n", error);
+		goto out;
+	}
+
+	if (!drc->drc_heal) {
 		if (drc->drc_newfs) {
-			zvol_create_minor(drc->drc_tofs);
+			error = zvol_create_minor(drc->drc_tofs);
+			if (error) {
+				printf("==== dmu_recv_end():P1,error=%d\n", error);
+				goto out;
+			}
 		}
 		char *snapname = kmem_asprintf("%s@%s",
 		    drc->drc_tofs, drc->drc_tosnap);
-		zvol_create_minor(snapname);
+		error = zvol_create_minor(snapname);
 		kmem_strfree(snapname);
+	}
+
+out:
+	if (error) {
+		printf("==== dmu_recv_end():P2,error=%d\n", error);
+		dmu_recv_cleanup_ds(drc);
+		nvlist_free(drc->drc_keynvl);
 	}
 
 	crfree(drc->drc_cred);
