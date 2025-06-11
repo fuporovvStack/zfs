@@ -963,7 +963,12 @@ spa_keystore_unload_wkey(const char *dsname)
 	dsl_pool_rele(dp, FTAG);
 
 	/* remove any zvols under this ds */
-	zvol_remove_minors(dp->dp_spa, dsname, B_TRUE);
+	ret = zvol_remove_minors(dp->dp_spa, dsname, B_TRUE);
+	if (ret != 0) {
+		/* XXX: Same as for spa_keystore_load_wkey() */
+		/* Add comment */
+		printf("==== spa_keystore_unload_wkey(), ret=%d\n", ret);
+	}
 
 	return (0);
 

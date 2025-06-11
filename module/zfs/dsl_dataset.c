@@ -3055,12 +3055,16 @@ dsl_dataset_rename_snapshot_sync_impl(dsl_pool_t *dp,
 	    ddrsa->ddrsa_oldsnapname);
 	newname = kmem_asprintf("%s@%s", ddrsa->ddrsa_fsname,
 	    ddrsa->ddrsa_newsnapname);
-	zvol_rename_minors(dp->dp_spa, oldname, newname, B_TRUE);
+	error = zvol_rename_minors(dp->dp_spa, oldname, newname, B_TRUE);
 	kmem_strfree(oldname);
 	kmem_strfree(newname);
 
 	dsl_dataset_rele(ds, FTAG);
-	return (0);
+
+	if (error)
+		printf("==== dsl_dataset_rename_snapshot_sync_impl(),error=%d\n", error);
+
+	return (error);
 }
 
 void

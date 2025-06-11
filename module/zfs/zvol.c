@@ -114,6 +114,8 @@ typedef struct {
 	char name1[MAXNAMELEN];
 	char name2[MAXNAMELEN];
 	uint64_t value;
+	boolean_t async;
+	int error;
 } zvol_task_t;
 
 zv_request_task_t *
@@ -1576,7 +1578,7 @@ zvol_free_task(void *arg)
 	zvol_os_free(arg);
 }
 
-void
+int
 zvol_remove_minors_impl(const char *name)
 {
 	zvol_state_t *zv, *zv_next;
@@ -1585,7 +1587,7 @@ zvol_remove_minors_impl(const char *name)
 	list_t delay_list, free_list;
 
 	if (zvol_inhibit_dev)
-		return;
+		return (0);
 
 	list_create(&delay_list, sizeof (zvol_state_t),
 	    offsetof(zvol_state_t, zv_next));
@@ -1658,6 +1660,8 @@ zvol_remove_minors_impl(const char *name)
 	/* Free any that we couldn't free in parallel earlier */
 	while ((zv = list_remove_head(&free_list)) != NULL)
 		zvol_os_free(zv);
+
+	return (0);
 }
 
 /* Remove minor for this specific volume only */
@@ -1712,14 +1716,15 @@ zvol_remove_minor_impl(const char *name)
 /*
  * Rename minors for specified dataset including children and snapshots.
  */
-static void
+static int
 zvol_rename_minors_impl(const char *oldname, const char *newname)
 {
 	zvol_state_t *zv, *zv_next;
 	int oldnamelen;
+	int error;
 
 	if (zvol_inhibit_dev)
-		return;
+		return (0);
 
 	oldnamelen = strlen(oldname);
 
@@ -1731,21 +1736,26 @@ zvol_rename_minors_impl(const char *oldname, const char *newname)
 		mutex_enter(&zv->zv_state_lock);
 
 		if (strcmp(zv->zv_name, oldname) == 0) {
-			zvol_os_rename_minor(zv, newname);
+			error = zvol_os_rename_minor(zv, newname);
 		} else if (strncmp(zv->zv_name, oldname, oldnamelen) == 0 &&
 		    (zv->zv_name[oldnamelen] == '/' ||
 		    zv->zv_name[oldnamelen] == '@')) {
 			char *name = kmem_asprintf("%s%c%s", newname,
 			    zv->zv_name[oldnamelen],
 			    zv->zv_name + oldnamelen + 1);
-			zvol_os_rename_minor(zv, name);
+			error = zvol_os_rename_minor(zv, name);
 			kmem_strfree(name);
 		}
 
 		mutex_exit(&zv->zv_state_lock);
+		if (error) {
+			printf("==== zvol_rename_minors_impl(), error=%d\n", error);
+			break;
+		}
 	}
 
 	rw_exit(&zvol_state_lock);
+	return (error);
 }
 
 typedef struct zvol_snapdev_cb_arg {
@@ -1834,7 +1844,7 @@ zvol_set_volmode_impl(char *name, uint64_t volmode)
 
 static zvol_task_t *
 zvol_task_alloc(zvol_async_op_t op, const char *name1, const char *name2,
-    uint64_t value)
+    uint64_t value, boolean_t async)
 {
 	zvol_task_t *task;
 
@@ -1845,6 +1855,7 @@ zvol_task_alloc(zvol_async_op_t op, const char *name1, const char *name2,
 	task = kmem_zalloc(sizeof (zvol_task_t), KM_SLEEP);
 	task->op = op;
 	task->value = value;
+	task->async = async;
 
 	strlcpy(task->name1, name1, sizeof (task->name1));
 	if (name2 != NULL)
@@ -1869,10 +1880,10 @@ zvol_task_cb(void *arg)
 
 	switch (task->op) {
 	case ZVOL_ASYNC_REMOVE_MINORS:
-		zvol_remove_minors_impl(task->name1);
+		task->error = zvol_remove_minors_impl(task->name1);
 		break;
 	case ZVOL_ASYNC_RENAME_MINORS:
-		zvol_rename_minors_impl(task->name1, task->name2);
+		task->error = zvol_rename_minors_impl(task->name1, task->name2);
 		break;
 	case ZVOL_ASYNC_SET_SNAPDEV:
 		zvol_set_snapdev_impl(task->name1, task->value);
@@ -1885,7 +1896,10 @@ zvol_task_cb(void *arg)
 		break;
 	}
 
-	zvol_task_free(task);
+	/* XXX: Comment, that task error will be lost */
+	if (task->async)
+		zvol_task_free(task);
+
 }
 
 typedef struct zvol_set_prop_int_arg {
@@ -1919,10 +1933,12 @@ zvol_set_common_check(void *arg, dmu_tx_t *tx)
 static int
 zvol_set_common_sync_cb(dsl_pool_t *dp, dsl_dataset_t *ds, void *arg)
 {
+	taskq_t *spa_zvol_taskq = dp->dp_spa->spa_zvol_taskq;
 	zvol_set_prop_int_arg_t *zsda = arg;
 	char dsname[ZFS_MAX_DATASET_NAME_LEN];
 	zvol_task_t *task;
 	uint64_t prop;
+	int error;
 
 	const char *prop_name = zfs_prop_to_name(zsda->zsda_prop);
 	dsl_dataset_name(ds, dsname);
@@ -1933,11 +1949,11 @@ zvol_set_common_sync_cb(dsl_pool_t *dp, dsl_dataset_t *ds, void *arg)
 	switch (zsda->zsda_prop) {
 		case ZFS_PROP_VOLMODE:
 			task = zvol_task_alloc(ZVOL_ASYNC_SET_VOLMODE, dsname,
-			    NULL, prop);
+			    NULL, prop, B_FALSE);
 			break;
 		case ZFS_PROP_SNAPDEV:
 			task = zvol_task_alloc(ZVOL_ASYNC_SET_SNAPDEV, dsname,
-			    NULL, prop);
+			    NULL, prop, B_FALSE);
 			break;
 		default:
 			task = NULL;
@@ -1947,9 +1963,14 @@ zvol_set_common_sync_cb(dsl_pool_t *dp, dsl_dataset_t *ds, void *arg)
 	if (task == NULL)
 		return (0);
 
-	(void) taskq_dispatch(dp->dp_spa->spa_zvol_taskq, zvol_task_cb,
-	    task, TQ_SLEEP);
-	return (0);
+	(void) taskq_dispatch(spa_zvol_taskq, zvol_task_cb, task, TQ_SLEEP);
+	taskq_wait(spa_zvol_taskq);
+	error = task->error;
+	zvol_task_free(task);
+	if (error)
+		printf("==== zvol_set_common_sync_cb(), error=%d\n", error);
+
+	return (error);
 }
 
 /*
@@ -1999,35 +2020,52 @@ zvol_set_common(const char *ddname, zfs_prop_t prop, zprop_source_t source,
 	    zvol_set_common_sync, &zsda, 0, ZFS_SPACE_CHECK_NONE));
 }
 
-void
+/*
+ * The function have two modes of call: sync/async. XXX - comment
+ */
+int
 zvol_remove_minors(spa_t *spa, const char *name, boolean_t async)
 {
 	zvol_task_t *task;
 	taskqid_t id;
+	int error = 0;
 
-	task = zvol_task_alloc(ZVOL_ASYNC_REMOVE_MINORS, name, NULL, ~0ULL);
+	task = zvol_task_alloc(ZVOL_ASYNC_REMOVE_MINORS, name, NULL, ~0ULL,
+	    async);
 	if (task == NULL)
-		return;
+		return (ENOMEM);
 
 	id = taskq_dispatch(spa->spa_zvol_taskq, zvol_task_cb, task, TQ_SLEEP);
-	if ((async == B_FALSE) && (id != TASKQID_INVALID))
+	if ((async == B_FALSE) && (id != TASKQID_INVALID)) {
 		taskq_wait_id(spa->spa_zvol_taskq, id);
+		error = task->error;
+		zvol_task_free(task);
+	}
+
+	return (error);
 }
 
-void
+int
 zvol_rename_minors(spa_t *spa, const char *name1, const char *name2,
     boolean_t async)
 {
 	zvol_task_t *task;
 	taskqid_t id;
+	int error = 0;
 
-	task = zvol_task_alloc(ZVOL_ASYNC_RENAME_MINORS, name1, name2, ~0ULL);
+	task = zvol_task_alloc(ZVOL_ASYNC_RENAME_MINORS, name1, name2, ~0ULL,
+	    async);
 	if (task == NULL)
-		return;
+		return (ENOMEM);
 
 	id = taskq_dispatch(spa->spa_zvol_taskq, zvol_task_cb, task, TQ_SLEEP);
-	if ((async == B_FALSE) && (id != TASKQID_INVALID))
+	if ((async == B_FALSE) && (id != TASKQID_INVALID)) {
 		taskq_wait_id(spa->spa_zvol_taskq, id);
+		error = task->error;
+		zvol_task_free(task);
+	}
+
+	return (error);
 }
 
 boolean_t
@@ -2128,7 +2166,9 @@ zvol_fini_impl(void)
 {
 	zv_taskq_t *ztqs = &zvol_taskqs;
 
-	zvol_remove_minors_impl(NULL);
+	int error = zvol_remove_minors_impl(NULL);
+	(void)error;
+	/* XXX: Handle error */
 
 	/*
 	 * The call to "zvol_remove_minors_impl" may dispatch entries to

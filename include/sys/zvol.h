@@ -38,8 +38,8 @@
 
 extern void zvol_create_minor(const char *);
 extern void zvol_create_minors_recursive(const char *);
-extern void zvol_remove_minors(spa_t *, const char *, boolean_t);
-extern void zvol_rename_minors(spa_t *, const char *, const char *, boolean_t);
+extern int zvol_remove_minors(spa_t *, const char *, boolean_t);
+extern int zvol_rename_minors(spa_t *, const char *, const char *, boolean_t);
 
 #ifdef _KERNEL
 struct zvol_state;

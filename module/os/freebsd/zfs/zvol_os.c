@@ -1248,9 +1248,11 @@ zvol_os_is_zvol(const char *device)
 	return (device && strncmp(device, ZVOL_DIR, strlen(ZVOL_DIR)) == 0);
 }
 
-void
+int
 zvol_os_rename_minor(zvol_state_t *zv, const char *newname)
 {
+	int error = 0;
+
 	ASSERT(RW_LOCK_HELD(&zvol_state_lock));
 	ASSERT(MUTEX_HELD(&zv->zv_state_lock));
 
@@ -1304,14 +1306,16 @@ zvol_os_rename_minor(zvol_state_t *zv, const char *newname)
 		args.mda_gid = GID_OPERATOR;
 		args.mda_mode = 0640;
 		args.mda_si_drv2 = zv;
-		if (make_dev_s(&args, &dev, "%s/%s", ZVOL_DRIVER, newname)
-		    == 0) {
-			dev->si_iosize_max = maxphys;
-			zsd->zsd_cdev = dev;
-		}
+		error = make_dev_s(&args, &dev, "%s/%s", ZVOL_DRIVER, newname);
+		if (error)
+			return (error);
+
+		dev->si_iosize_max = maxphys;
+		zsd->zsd_cdev = dev;
 	}
 	strlcpy(zv->zv_name, newname, sizeof (zv->zv_name));
 	dataset_kstats_rename(&zv->zv_kstat, newname);
+	return (error);
 }
 
 /*

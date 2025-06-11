@@ -1048,17 +1048,19 @@ zvol_create_minors_recursive(const char *name)
 	(void) name;
 }
 
-void
+int
 zvol_remove_minors(spa_t *spa, const char *name, boolean_t async)
 {
 	(void) spa, (void) name, (void) async;
+	return (0);
 }
 
-void
+int
 zvol_rename_minors(spa_t *spa, const char *oldname, const char *newname,
     boolean_t async)
 {
 	(void) spa, (void) oldname, (void) newname, (void) async;
+	return (0);
 }
 
 /*

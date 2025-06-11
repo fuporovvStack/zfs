@@ -583,7 +583,8 @@ dsl_destroy_snapshot_sync(void *arg, dmu_tx_t *tx)
 		return;
 	ASSERT0(error);
 	dsl_destroy_snapshot_sync_impl(ds, defer, tx);
-	zvol_remove_minors(dp->dp_spa, dsname, B_TRUE);
+	error = zvol_remove_minors(dp->dp_spa, dsname, B_TRUE);
+	ASSERT0(error);
 	dsl_dataset_rele(ds, FTAG);
 }
 
@@ -1185,10 +1186,12 @@ dsl_destroy_head_sync(void *arg, dmu_tx_t *tx)
 	dsl_destroy_head_arg_t *ddha = arg;
 	dsl_pool_t *dp = dmu_tx_pool(tx);
 	dsl_dataset_t *ds;
+	int error;
 
 	VERIFY0(dsl_dataset_hold(dp, ddha->ddha_name, FTAG, &ds));
 	dsl_destroy_head_sync_impl(ds, tx);
-	zvol_remove_minors(dp->dp_spa, ddha->ddha_name, B_TRUE);
+	error = zvol_remove_minors(dp->dp_spa, ddha->ddha_name, B_TRUE);
+	ASSERT0(error);
 	dsl_dataset_rele(ds, FTAG);
 }
 

@@ -1701,7 +1701,7 @@ out_doi:
 	return (error);
 }
 
-void
+int
 zvol_os_rename_minor(zvol_state_t *zv, const char *newname)
 {
 	int readonly = get_disk_ro(zv->zv_zso->zvo_disk);
@@ -1728,6 +1728,7 @@ zvol_os_rename_minor(zvol_state_t *zv, const char *newname)
 	set_disk_ro(zv->zv_zso->zvo_disk, readonly);
 
 	dataset_kstats_rename(&zv->zv_kstat, newname);
+	return (0);
 }
 
 void

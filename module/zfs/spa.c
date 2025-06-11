@@ -7069,8 +7069,11 @@ spa_export_common(const char *pool, int new_state, nvlist_t **oldconfig,
 	mutex_exit(&spa_namespace_lock);
 	spa_async_suspend(spa);
 	if (spa->spa_zvol_taskq) {
-		zvol_remove_minors(spa, spa_name(spa), B_TRUE);
-		taskq_wait(spa->spa_zvol_taskq);
+		error = zvol_remove_minors(spa, spa_name(spa), B_FALSE);
+		if (error) {
+			printf("==== spa_export_common(), error=%d\n", error);
+			goto fail;
+		}
 	}
 	mutex_enter(&spa_namespace_lock);
 	spa->spa_export_thread = curthread;

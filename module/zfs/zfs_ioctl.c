@@ -4001,6 +4001,7 @@ zfs_ioc_destroy_snaps(const char *poolname, nvlist_t *innvl, nvlist_t *outnvl)
 	nvpair_t *pair;
 	boolean_t defer;
 	spa_t *spa;
+	int error = 0;
 
 	snaps = fnvlist_lookup_nvlist(innvl, "snaps");
 	defer = nvlist_exists(innvl, "defer");
@@ -4020,8 +4021,13 @@ zfs_ioc_destroy_snaps(const char *poolname, nvlist_t *innvl, nvlist_t *outnvl)
 
 		zfs_unmount_snap(nvpair_name(pair));
 		if (spa_open(name, &spa, FTAG) == 0) {
-			zvol_remove_minors(spa, name, B_TRUE);
+			error = zvol_remove_minors(spa, name, B_TRUE);
 			spa_close(spa, FTAG);
+		}
+		if (error) {
+			printf("==== zfs_ioc_destroy_snaps(),error=%d\n", error);
+			dsl_destroy_snapshots_nvl(snaps, defer, outnvl);
+			return (error);
 		}
 	}
 
