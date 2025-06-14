@@ -1370,7 +1370,7 @@ zvol_alloc(const char *name, uint64_t volblocksize)
 		args.mda_mode = 0640;
 		args.mda_si_drv2 = zv;
 		if (make_dev_s(&args, &dev, "%s/%s", ZVOL_DRIVER, name) != 0) {
-			kmem_free(zso, sizeof (struct zvol_state_os));
+			kmem_free(zv->zv_zso, sizeof (struct zvol_state_os));
 			kmem_free(zv, sizeof (zvol_state_t));
 			return (NULL);
 		}
